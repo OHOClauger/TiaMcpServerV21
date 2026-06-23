@@ -1,0 +1,57 @@
+name: CI / Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    # Self-hosted runner required: TIA Portal V20 + .NET Framework 4.8 must be installed
+    runs-on: self-hosted
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore
+        run: dotnet restore TiaMcpServer.sln
+
+      - name: Build
+        run: dotnet build TiaMcpServer.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test TiaMcpServer.sln -c Release --no-build --logger trx
+        continue-on-error: true  # Tests require running TIA Portal instance
+
+      - name: Package artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        run: |
+          Compress-Archive -Path src/TiaMcpServer/bin/Release/net48/* -DestinationPath TiaMcpServer-${{ github.ref_name }}.zip
+
+      - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: TiaMcpServer-${{ github.ref_name }}
+          path: TiaMcpServer-${{ github.ref_name }}.zip
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TiaMcpServer-${{ github.ref_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TiaMcpServer-${{ github.ref_name }}.zip
+          generate_release_notes: true

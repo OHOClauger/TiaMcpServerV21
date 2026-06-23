@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "tiaportal-mcp-compiled": {
+      "command": "<path-to>\\TiaMcpServer.exe",
+      "args": [
+          "--tia-major-version",
+          "18"
+      ],
+      "env": {}
+    },
+    "tiaportal-mcp-vsproject": {
+      "command": "dotnet",
+      "args": [
+          "run",
+          "--project",
+          "<path-to>\\tiaportal-mcp\\src\\TiaMcpServer\\TiaMcpServer.csproj",
+          "--tia-major-version",
+          "18"
+      ]
+    }
+  }
+}

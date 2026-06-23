@@ -1,0 +1,6 @@
+.vs/
+.gemini/
+.cursor/
+bin/
+obj/
+TestResults/

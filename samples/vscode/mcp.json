@@ -1,0 +1,12 @@
+{
+    "servers": {
+        "vscode-tiaportal-mcp": {
+        "command": "c:\\Users\\<user>\\.vscode\\extensions\\jheilingbrunner.vscode-tiaportal-mcp-<version>\\srv\\net48\\TiaMcpServer.exe",
+        "args": [
+            "--tia-major-version",
+            "18"
+        ],
+        "env": {}
+        }
+    }
+}
