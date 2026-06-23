@@ -620,6 +620,27 @@ namespace TiaMcpServer.Siemens
         {
             _logger?.LogInformation("Getting project tree...");
 
+            if (_portal != null && _project == null)
+            {
+                try
+                {
+                    if (_portal.LocalSessions.Any())
+                    {
+                        _session = _portal.LocalSessions.First();
+                        _project = _session.Project;
+                    }
+                    else if (_portal.Projects.Any())
+                    {
+                        _project = _portal.Projects.First();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "GetProjectTree: failed to refresh project from portal, retrying ConnectPortal");
+                    ConnectPortal();
+                }
+            }
+
             if (IsProjectNull())
             {
                 return string.Empty;
@@ -669,6 +690,27 @@ namespace TiaMcpServer.Siemens
         {
             _logger?.LogInformation("Getting devices...");
 
+            if (_portal != null && _project == null)
+            {
+                try
+                {
+                    if (_portal.LocalSessions.Any())
+                    {
+                        _session = _portal.LocalSessions.First();
+                        _project = _session.Project;
+                    }
+                    else if (_portal.Projects.Any())
+                    {
+                        _project = _portal.Projects.First();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "GetDevices: failed to refresh project from portal, retrying ConnectPortal");
+                    ConnectPortal();
+                }
+            }
+
             if (IsProjectNull())
             {
                 return [];
@@ -676,24 +718,42 @@ namespace TiaMcpServer.Siemens
 
             var list = new List<Device>();
 
-            if (_project?.Devices != null)
+            var dbgLog = @"C:\Tools\TiaMcpServer-V21\debug_getdevices.txt";
+            System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] GetDevices called. _project={_project?.Name}, type={_project?.GetType().Name}\n");
+
+            try
             {
-                foreach (Device device in _project.Devices)
-                {
-                    list.Add(device);
-                }
+                System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] Accessing _project.Devices...\n");
+                var devices = _project?.Devices;
+                System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] devices count={devices?.Count}\n");
 
-                foreach (var group in _project.DeviceGroups)
+                if (devices != null)
                 {
-                    GetDevicesRecursive(group, list, regexName);
-                }
+                    foreach (Device device in devices)
+                    {
+                        list.Add(device);
+                        try
+                        {
+                            var itemNames = string.Join(", ", device.DeviceItems.Cast<DeviceItem>().Select(di => di.Name));
+                            System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] Device '{device.Name}' items: [{itemNames}]\n");
+                        }
+                        catch (Exception ex2)
+                        {
+                            System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] Device '{device.Name}' items error: {ex2.Message}\n");
+                        }
+                    }
 
-                //foreach (var group in _project.UngroupedDevicesGroup)
-                //{
-                //    GetDevicesRecursive(_project.UngroupedDevicesGroup, list, regexName);
-                //}
+                    foreach (var group in _project.DeviceGroups)
+                        GetDevicesRecursive(group, list, regexName);
+                }
+            }
+            catch (Exception ex)
+            {
+                System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] EXCEPTION: {ex.GetType().Name}: {ex.Message}\nStack: {ex.StackTrace}\n");
+                throw;
             }
 
+            System.IO.File.AppendAllText(dbgLog, $"[{DateTime.Now:HH:mm:ss.fff}] Returning {list.Count} devices\n");
             return list;
         }
 

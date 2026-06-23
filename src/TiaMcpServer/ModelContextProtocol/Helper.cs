@@ -15,13 +15,22 @@ namespace TiaMcpServer.ModelContextProtocol
             {
                 foreach (var attr in obj.GetAttributeInfos())
                 {
-                    object value = obj.GetAttribute(attr.Name);
-                    attributes.Add(new Attribute
+                    try
                     {
-                        Name = attr.Name,
-                        Value = value,
-                        AccessMode = Enum.GetName(typeof(EngineeringAttributeAccessMode), attr.AccessMode)
-                    });
+                        object value = obj.GetAttribute(attr.Name);
+                        string? valueStr = null;
+                        try { valueStr = value?.ToString(); } catch (Exception) { valueStr = null; }
+                        attributes.Add(new Attribute
+                        {
+                            Name = attr.Name,
+                            Value = valueStr,
+                            AccessMode = Enum.GetName(typeof(EngineeringAttributeAccessMode), attr.AccessMode)
+                        });
+                    }
+                    catch (Exception)
+                    {
+                        // skip unreadable attributes
+                    }
                 }
             }
 

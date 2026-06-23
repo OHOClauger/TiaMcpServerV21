@@ -624,11 +624,13 @@ namespace TiaMcpServer.ModelContextProtocol
                         if (device != null)
                         {
                             var attributes = Helper.GetAttributeList(device);
+                            string deviceName = null; try { deviceName = device.Name; } catch (Exception) { }
+                            string deviceDesc = null; try { deviceDesc = device.ToString(); } catch (Exception) { }
                             responseList.Add(new ResponseDeviceInfo
                             {
-                                Name = device.Name,
+                                Name = deviceName,
                                 Attributes = attributes,
-                                Description = device.ToString()
+                                Description = deviceDesc
                             });
                         }
                     }
@@ -651,7 +653,7 @@ namespace TiaMcpServer.ModelContextProtocol
             }
             catch (Exception ex) when (ex is not McpException)
             {
-                throw new McpException($"Unexpected error retrieving devices: {ex.Message}", ex, McpErrorCode.InternalError);
+                throw new McpException($"GetDevices error [{ex.GetType().Name}]: {ex.Message} | {ex.InnerException?.Message} | Stack: {ex.StackTrace?.Split('\n').FirstOrDefault()}", ex, McpErrorCode.InternalError);
             }
         }
 
