@@ -1,5 +1,21 @@
 # Change Log
 
+## [0.0.21] - 2026-06-30
+
+### New Tools (14)
+- **HMI Screens (WinCC Unified)**: `GetHmiScreenTree`, `GetHmiScreenItems`, `CloneHmiScreen`, `RepointScreenBindings`
+- **HMI Tags (WinCC Unified)**: `GetHmiTags`, `ExportHmiTags`, `ImportHmiTags`
+- **Development**: `EvalCSharp` (compile & run C# in-process against the live Openness session, no rebuild/restart)
+
+### Fixes
+- COM serialization crash and improved device item path resolution
+- Corrects Siemens Engineering DLL loading for TIA Portal V21
+
+### Infrastructure
+- Build: project now compiles without the .NET Framework 4.8 Developer Pack installed (`Microsoft.NETFramework.ReferenceAssemblies` package)
+- Docs: README updated for TIA Portal V21 (was still documenting V20 as default) and full tool catalog (51 -> 65 tools)
+- Bump: AssemblyVersion 0.0.20 -> 0.0.21
+
 ## [0.0.20] - 2026-06-02
 
 ### New Tools (2)

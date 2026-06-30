@@ -7,8 +7,8 @@ An MCP server that connects LLMs to Siemens TIA Portal via the Openness API. Bro
 ### 1. Prerequisites
 
 - Windows with **.NET Framework 4.8**
-- **Siemens TIA Portal V20** installed and running
-- Environment variable `TiaPortalLocation` set to `C:\Program Files\Siemens\Automation\Portal V20`
+- **Siemens TIA Portal V21** installed and running
+- Environment variable `TiaPortalLocation` set to `C:\Program Files\Siemens\Automation\Portal V21`
 - User in Windows group **Siemens TIA Openness**
 
 ### 2. Download
@@ -56,7 +56,7 @@ Download `TiaMcpServer-<version>.zip` from [GitHub Releases](../../releases) and
 }
 ```
 
-> For TIA Portal V18 or V19, add `"--tia-major-version", "18"` to `args`.
+> For TIA Portal V18, V19, or V20, add `"--tia-major-version", "18"` (adjust the number) to `args`.
 
 ### 4. Use it
 
@@ -69,7 +69,7 @@ dotnet build -c Release
 # Output: src/TiaMcpServer/bin/Release/net48/TiaMcpServer.exe
 ```
 
-## Available Tools (51)
+## Available Tools (65)
 
 ### Connection & State
 
@@ -147,13 +147,26 @@ dotnet build -c Release
 | `ExportPlcTagTable` | Export a tag table |
 | `ImportPlcTagTable` | Import a tag table |
 
-### HMI Screens
+### HMI Screens & Tags (incl. WinCC Unified)
 
 | Tool | Description |
 |------|-------------|
 | `GetHmiScreens` | List HMI screens |
+| `GetHmiScreenTree` | Get full screen inventory as a folder tree (recurses, unlike `GetHmiScreens`) |
+| `GetHmiScreenItems` | Get a screen's items/objects tree, incl. attributes and tag/PLC dynamizations |
 | `ExportHmiScreen` | Export an HMI screen |
 | `ImportHmiScreen` | Import an HMI screen |
+| `CloneHmiScreen` | Proof-of-concept: recreate a WinCC Unified screen via the object model (no native Copy in Openness) |
+| `RepointScreenBindings` | Replace a tag/faceplate binding value across a screen's dynamizations |
+| `GetHmiTags` | List HMI tags (WinCC Unified) with connection, PLC tag/address and data type |
+| `ExportHmiTags` | Export an HMI tag table's tags to XML (WinCC Unified) |
+| `ImportHmiTags` | Import HMI tags into a tag table (WinCC Unified, override) |
+
+### Development
+
+| Tool | Description |
+|------|-------------|
+| `EvalCSharp` | Dev tool: compile & run a C# snippet in-process against the live Openness session, without rebuilding/restarting the server |
 
 ### Libraries
 
@@ -190,8 +203,8 @@ dotnet build -c Release
 
 ## TIA Portal Versions
 
-- **V20** is the default version.
-- Previous versions (V18, V19) are supported via the `--tia-major-version` argument.
+- **V21** is the default version.
+- Previous versions (V18, V19, V20) are supported via the `--tia-major-version` argument.
 - Export/import as documents (.s7dcl/.s7res) requires TIA Portal V20 or newer.
 
 ## Known Limitations
