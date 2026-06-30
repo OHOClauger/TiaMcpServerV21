@@ -1,3 +1,5 @@
+using Microsoft.CodeAnalysis.CSharp.Scripting;
+using Microsoft.CodeAnalysis.Scripting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol;
@@ -22,6 +24,14 @@ using TiaMcpServer.Siemens;
 
 namespace TiaMcpServer.ModelContextProtocol
 {
+    // Globals available to EvalCSharp snippets: the live Portal (with CurrentProject/CurrentPortal) and a Print() sink.
+    public class EvalGlobals
+    {
+        public TiaMcpServer.Siemens.Portal Portal = null!;
+        public System.Text.StringBuilder Out = new System.Text.StringBuilder();
+        public void Print(object o) { Out.AppendLine(o?.ToString() ?? "null"); }
+    }
+
     [McpServerToolType]
     public static class McpServer
     {
@@ -2430,6 +2440,192 @@ namespace TiaMcpServer.ModelContextProtocol
             catch (Exception ex) when (ex is not McpException)
             {
                 throw new McpException($"Unexpected error importing HMI screen from '{importPath}': {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "ExportHmiTags"), Description("Export an HMI tag table's tags to a directory (WinCC Unified). Use to round-trip/duplicate tag definitions via XML.")]
+        public static ResponseMessage ExportHmiTags(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("tableName: name of the HMI tag table")] string tableName,
+            [Description("exportDir: directory where to export")] string exportDir)
+        {
+            try
+            {
+                var r = Portal.ExportHmiTags(softwarePath, tableName, exportDir);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error exporting HMI tags: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "ImportHmiTags"), Description("Import HMI tags into a tag table from a directory (WinCC Unified, Override).")]
+        public static ResponseMessage ImportHmiTags(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("tableName: name of the HMI tag table")] string tableName,
+            [Description("importDir: directory to import from")] string importDir)
+        {
+            try
+            {
+                var r = Portal.ImportHmiTags(softwarePath, tableName, importDir);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error importing HMI tags: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "RepointScreenBindings"), Description("Repoint tag bindings on a WinCC Unified screen: replaces 'find' with 'replace' inside TagDynamization tags and faceplate interface values. No item creation (safe). Returns a change report.")]
+        public static ResponseMessage RepointScreenBindings(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("screenName: screen to modify")] string screenName,
+            [Description("find: substring to find in tag bindings (e.g. Frigo_02)")] string find,
+            [Description("replace: replacement substring (e.g. Frigo_03)")] string replace)
+        {
+            try
+            {
+                var r = Portal.RepointScreenBindings(softwarePath, screenName, find, replace);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error repointing bindings: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "CloneHmiScreen"), Description("Proof-of-concept: recreate (clone) a WinCC Unified screen into a new screen by rebuilding its screen items via the object model (Openness has no screen Copy). Returns a coverage report (items/attributes/dynamizations created vs failed).")]
+        public static ResponseMessage CloneHmiScreen(
+            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
+            [Description("srcScreen: name of the existing source screen to clone")] string srcScreen,
+            [Description("destScreen: name of the new screen to create")] string destScreen)
+        {
+            try
+            {
+                var dump = Portal.CloneHmiScreen(softwarePath, srcScreen, destScreen);
+                return new ResponseMessage
+                {
+                    Message = dump,
+                    Meta = new JsonObject
+                    {
+                        ["timestamp"] = DateTime.Now,
+                        ["success"] = !dump.StartsWith("ERROR")
+                    }
+                };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error cloning HMI screen '{srcScreen}': {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "EvalCSharp"), Description("DEV TOOL: compile & run a C# snippet IN-PROCESS against the live TIA Portal Openness session — lets the server be extended/iterated WITHOUT rebuilding or restarting. Globals: 'Portal' (the Portal instance; Portal.CurrentProject = open ProjectBase, Portal.CurrentPortal = TiaPortal), and 'Print(obj)' to log output. Code may be statements and/or end with an expression (its value is returned). All loaded assemblies are referenced (Siemens.Engineering.*, HmiUnified, etc.).")]
+        public static ResponseMessage EvalCSharp(
+            [Description("C# code. Access the project via Portal.CurrentProject; log via Print(...). Example: Print(Portal.CurrentProject?.Name);")] string code)
+        {
+            try
+            {
+                var globals = new EvalGlobals { Portal = Portal };
+                var refs = AppDomain.CurrentDomain.GetAssemblies()
+                    .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location))
+                    .ToList();
+                var options = ScriptOptions.Default
+                    .WithReferences(refs)
+                    .WithImports(
+                        "System", "System.Linq", "System.Collections.Generic", "System.Text", "System.IO",
+                        "Siemens.Engineering", "Siemens.Engineering.HW", "Siemens.Engineering.SW",
+                        "Siemens.Engineering.SW.Blocks", "Siemens.Engineering.HmiUnified", "TiaMcpServer.Siemens");
+
+                var result = CSharpScript.EvaluateAsync(code, options, globals).GetAwaiter().GetResult();
+                var outText = globals.Out.ToString();
+                var msg = outText;
+                if (result != null) msg += (msg.Length > 0 ? "\r\n" : "") + "[return] " + result;
+                return new ResponseMessage
+                {
+                    Message = string.IsNullOrEmpty(msg) ? "(no output)" : msg,
+                    Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = true }
+                };
+            }
+            catch (Exception ex)
+            {
+                var m = ex.InnerException?.Message ?? ex.Message;
+                return new ResponseMessage
+                {
+                    Message = "ERROR: " + m,
+                    Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = false }
+                };
+            }
+        }
+
+        [McpServerTool(Name = "GetHmiTags"), Description("List HMI tags (WinCC Unified) with their connection, PLC tag/address and data type. Enumerates the default tag collection and all tag tables (including nested groups). Optional regex filters by tag name.")]
+        public static ResponseMessage GetHmiTags(
+            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
+            [Description("regexName: optional regex to filter tags by name. Empty = all")] string regexName = "")
+        {
+            try
+            {
+                var dump = Portal.GetHmiTags(softwarePath, regexName);
+                return new ResponseMessage
+                {
+                    Message = dump,
+                    Meta = new JsonObject
+                    {
+                        ["timestamp"] = DateTime.Now,
+                        ["success"] = !dump.StartsWith("ERROR")
+                    }
+                };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error reading HMI tags from '{softwarePath}': {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "GetHmiScreenTree"), Description("Get the full screen inventory of an HMI software as an indented tree of folders and screens (recurses into screen folders, which the flat GetHmiScreens list does not).")]
+        public static ResponseMessage GetHmiScreenTree(
+            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath)
+        {
+            try
+            {
+                var dump = Portal.GetHmiScreenTree(softwarePath);
+                return new ResponseMessage
+                {
+                    Message = dump,
+                    Meta = new JsonObject
+                    {
+                        ["timestamp"] = DateTime.Now,
+                        ["success"] = !dump.StartsWith("ERROR")
+                    }
+                };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error reading HMI screen tree from '{softwarePath}': {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "GetHmiScreenItems"), Description("Get the screen items (graphical objects) tree of an HMI screen, including types, key attributes and Dynamizations (tag/PLC bindings). Works for WinCC Unified via the object model.")]
+        public static ResponseMessage GetHmiScreenItems(
+            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
+            [Description("screenName: name of the HMI screen to inspect")] string screenName)
+        {
+            try
+            {
+                var dump = Portal.GetHmiScreenItems(softwarePath, screenName);
+                return new ResponseMessage
+                {
+                    Message = dump,
+                    Meta = new JsonObject
+                    {
+                        ["timestamp"] = DateTime.Now,
+                        ["success"] = !dump.StartsWith("ERROR")
+                    }
+                };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error reading HMI screen items from '{screenName}': {ex.Message}", ex, McpErrorCode.InternalError);
             }
         }
 
