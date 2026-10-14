@@ -37,6 +37,10 @@ namespace TiaMcpServer.Siemens
         private LocalSession? _session;
         private readonly ILogger<Portal>? _logger;
 
+        // Live handles exposed for the EvalCSharp dev tool (run Openness code in-process without rebuilds).
+        public ProjectBase? CurrentProject => _project;
+        public TiaPortal? CurrentPortal => _portal;
+
         #region ctor
 
         public Portal(ILogger<Portal>? logger = null)
@@ -1115,16 +1119,18 @@ namespace TiaMcpServer.Siemens
 
             try
             {
-                var softwareContainer = GetSoftwareContainer(softwarePath);
+                var software = GetSoftwareContainer(softwarePath)?.Software;
 
-                // WinCC Unified (V19+)
-                if (softwareContainer?.Software is HmiSoftware hmiSoftware)
+                // WinCC Comfort/Unified - enumerate root screens AND screens nested in folders
+                if (software != null)
                 {
-                    foreach (var screen in hmiSoftware.Screens)
+                    foreach (var screen in EnumerateScreens(software))
                     {
+                        if (screen is not IEngineeringObject eo) continue;
                         try
                         {
-                            if (!string.IsNullOrEmpty(regexName) && !Regex.IsMatch(screen.Name, regexName, RegexOptions.IgnoreCase))
+                            var name = screen.GetType().GetProperty("Name")?.GetValue(screen) as string ?? "";
+                            if (!string.IsNullOrEmpty(regexName) && !Regex.IsMatch(name, regexName, RegexOptions.IgnoreCase))
                             {
                                 continue;
                             }
@@ -1134,7 +1140,7 @@ namespace TiaMcpServer.Siemens
                             continue;
                         }
 
-                        list.Add(screen);
+                        list.Add(eo);
                     }
                 }
             }
@@ -1158,24 +1164,25 @@ namespace TiaMcpServer.Siemens
                 }
 
                 var softwareContainer = GetSoftwareContainer(softwarePath);
-
-                IEngineeringObject? screen = null;
-
-                if (softwareContainer?.Software is HmiSoftware hmiSoftware)
+                var software = softwareContainer?.Software;
+                if (software == null)
                 {
-                    foreach (var s in hmiSoftware.Screens)
-                    {
-                        if (s.Name.Equals(screenName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            screen = s;
-                            break;
-                        }
-                    }
+                    throw new PortalException(PortalErrorCode.NotFound, $"HMI software not found: {softwarePath}");
                 }
 
+                _logger?.LogInformation("HMI software runtime type: {Type}", software.GetType().FullName);
+
+                var screen = FindHmiScreen(software, screenName);
                 if (screen == null)
                 {
-                    throw new PortalException(PortalErrorCode.NotFound, $"HMI screen not found: {screenName}. Note: only WinCC Unified screens are supported.");
+                    throw new PortalException(PortalErrorCode.NotFound, $"HMI screen not found: {screenName}");
+                }
+
+                _logger?.LogInformation("HMI screen runtime type: {Type}", screen.GetType().FullName);
+
+                if (!Directory.Exists(exportPath))
+                {
+                    Directory.CreateDirectory(exportPath);
                 }
 
                 var filePath = Path.Combine(exportPath, $"{screenName}.xml");
@@ -1184,16 +1191,7 @@ namespace TiaMcpServer.Siemens
                     File.Delete(filePath);
                 }
 
-                // Use reflection to call Export since the concrete HMI screen type varies
-                var exportMethod = screen.GetType().GetMethod("Export", new[] { typeof(FileInfo), typeof(ExportOptions) });
-                if (exportMethod != null)
-                {
-                    exportMethod.Invoke(screen, new object[] { new FileInfo(filePath), ExportOptions.None });
-                }
-                else
-                {
-                    throw new PortalException(PortalErrorCode.ExportFailed, "Screen does not support export");
-                }
+                InvokeExport(screen, new FileInfo(filePath));
 
                 return true;
             }
@@ -1229,25 +1227,830 @@ namespace TiaMcpServer.Siemens
                     return false;
                 }
 
-                if (softwareContainer?.Software is HmiSoftware hmiSoftware)
+                var software = softwareContainer?.Software;
+                if (software != null)
                 {
-                    // Use reflection since HmiScreenComposition may not have Import directly
-                    var screens = hmiSoftware.Screens;
-                    var importMethod = screens.GetType().GetMethod("Import", new[] { typeof(FileInfo), typeof(ImportOptions) });
-                    if (importMethod != null)
+                    _logger?.LogInformation("HMI software runtime type: {Type}", software.GetType().FullName);
+
+                    // Get the "Screens" composition via reflection (works for Comfort HmiSoftware and Unified HmiUnifiedSoftware)
+                    var screensProp = software.GetType().GetProperty("Screens");
+                    var screens = screensProp?.GetValue(software);
+                    if (screens == null)
                     {
-                        importMethod.Invoke(screens, new object[] { fileInfo, ImportOptions.Override });
-                        return true;
+                        return false;
                     }
-                    return false;
+
+                    var importMethods = screens.GetType().GetMethods()
+                        .Where(m => m.Name == "Import").ToList();
+                    foreach (var m in importMethods)
+                    {
+                        _logger?.LogInformation("Import overload: ({Params})",
+                            string.Join(", ", m.GetParameters().Select(p => p.ParameterType.FullName)));
+                    }
+
+                    var importMethod = importMethods.FirstOrDefault(m =>
+                    {
+                        var ps = m.GetParameters();
+                        return ps.Length >= 1 && typeof(FileInfo).IsAssignableFrom(ps[0].ParameterType);
+                    });
+                    if (importMethod == null)
+                    {
+                        return false;
+                    }
+
+                    var pars = importMethod.GetParameters();
+                    var args = new object?[pars.Length];
+                    args[0] = fileInfo;
+                    for (int i = 1; i < pars.Length; i++)
+                    {
+                        if (pars[i].ParameterType == typeof(ImportOptions)) args[i] = ImportOptions.Override;
+                        else if (pars[i].HasDefaultValue) args[i] = pars[i].DefaultValue;
+                        else args[i] = pars[i].ParameterType.IsValueType ? Activator.CreateInstance(pars[i].ParameterType) : null;
+                    }
+                    importMethod.Invoke(screens, args);
+                    return true;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                _logger?.LogError(ex, "ImportHmiScreen failed for {SoftwarePath} {ImportPath}", softwarePath, importPath);
                 return false;
             }
 
             return false;
+        }
+
+        // Finds an HMI screen by name on any HMI software type (Comfort HmiSoftware or Unified HmiUnifiedSoftware),
+        // searching the root Screens collection AND recursively inside ScreenFolders (WinCC Unified organizes
+        // screens in folders, which the root Screens property does not include).
+        private object? FindHmiScreen(object software, string screenName)
+        {
+            foreach (var s in EnumerateScreens(software))
+            {
+                var name = s.GetType().GetProperty("Name")?.GetValue(s) as string;
+                if (string.Equals(name, screenName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return s;
+                }
+            }
+            return null;
+        }
+
+        // Snapshots an Openness composition into a list sorted by the object's Name (case-insensitive,
+        // ordinal) so outputs match the WinCC editor's alphabetical order instead of raw API order.
+        private List<object> SnapshotSortedByName(object enumerable)
+        {
+            var list = Snapshot(enumerable);
+            list.Sort((a, b) => string.Compare(
+                a.GetType().GetProperty("Name")?.GetValue(a) as string ?? "",
+                b.GetType().GetProperty("Name")?.GetValue(b) as string ?? "",
+                StringComparison.OrdinalIgnoreCase));
+            return list;
+        }
+
+        // Yields every screen of an HMI software, descending recursively through screen folders.
+        // Works for both Comfort (HmiSoftware) and Unified (HmiUnifiedSoftware) via reflection.
+        // Screens and groups are returned sorted by name to match the editor.
+        private IEnumerable<object> EnumerateScreens(object container)
+        {
+            // screens directly in this container (sorted by name)
+            foreach (var s in SnapshotSortedByName(container.GetType().GetProperty("Screens")?.GetValue(container)))
+            {
+                yield return s;
+            }
+
+            // recurse into screen groups (WinCC Unified: "ScreenGroups" on the software root, "Groups" on a group), sorted
+            foreach (var groupPropName in new[] { "ScreenGroups", "Groups" })
+            {
+                foreach (var group in SnapshotSortedByName(container.GetType().GetProperty(groupPropName)?.GetValue(container)))
+                {
+                    foreach (var s in EnumerateScreens(group))
+                    {
+                        yield return s;
+                    }
+                }
+            }
+        }
+
+        // Builds an indented tree of screen folders and screens for an HMI software.
+        public string GetHmiScreenTree(string softwarePath)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var sb = new StringBuilder();
+                sb.AppendLine($"HMI software '{softwarePath}' [{software.GetType().FullName}]");
+                DumpScreenFolder(software, sb, 1);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "GetHmiScreenTree failed for {SoftwarePath}", softwarePath);
+                return "ERROR: " + ex.Message;
+            }
+        }
+
+        private void DumpScreenFolder(object container, StringBuilder sb, int depth)
+        {
+            var pad = new string(' ', depth * 2);
+            foreach (var s in SnapshotSortedByName(container.GetType().GetProperty("Screens")?.GetValue(container)))
+            {
+                var name = s.GetType().GetProperty("Name")?.GetValue(s) as string;
+                sb.AppendLine($"{pad}[screen] {name}");
+            }
+            foreach (var groupPropName in new[] { "ScreenGroups", "Groups" })
+            {
+                foreach (var group in SnapshotSortedByName(container.GetType().GetProperty(groupPropName)?.GetValue(container)))
+                {
+                    var fname = group.GetType().GetProperty("Name")?.GetValue(group) as string;
+                    sb.AppendLine($"{pad}<group> {fname}");
+                    DumpScreenFolder(group, sb, depth + 1);
+                }
+            }
+        }
+
+        // Invokes the screen's Export method via reflection, matching any overload whose first
+        // parameter is a FileInfo. Logs all available overloads for diagnostics.
+        private void InvokeExport(object screen, FileInfo file)
+        {
+            var exportMethods = screen.GetType().GetMethods()
+                .Where(m => m.Name == "Export").ToList();
+            foreach (var m in exportMethods)
+            {
+                _logger?.LogInformation("Export overload: ({Params})",
+                    string.Join(", ", m.GetParameters().Select(p => p.ParameterType.FullName)));
+            }
+
+            var method = exportMethods.FirstOrDefault(m =>
+            {
+                var ps = m.GetParameters();
+                return ps.Length >= 1 && typeof(FileInfo).IsAssignableFrom(ps[0].ParameterType);
+            });
+            if (method == null)
+            {
+                // Diagnostic: list all export/import/save-like methods with full signatures
+                var candidates = screen.GetType().GetMethods()
+                    .Where(m => m.Name.IndexOf("xport", StringComparison.OrdinalIgnoreCase) >= 0
+                             || m.Name.IndexOf("mport", StringComparison.OrdinalIgnoreCase) >= 0
+                             || m.Name.IndexOf("Save", StringComparison.OrdinalIgnoreCase) >= 0)
+                    .Select(m => m.Name + "(" + string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name)) + ")")
+                    .Distinct()
+                    .ToList();
+                var dump = candidates.Count > 0 ? string.Join(" | ", candidates) : "(none)";
+                throw new PortalException(PortalErrorCode.ExportFailed,
+                    "Screen type " + screen.GetType().FullName + " exposes no XML Export method (candidates: " + dump + "). " +
+                    "WinCC Unified screens do not support SimaticML export/import via Openness; use the screen object model (HmiScreenComposition.Create, HmiScreen.ScreenItems) instead.");
+            }
+
+            var pars = method.GetParameters();
+            var args = new object?[pars.Length];
+            args[0] = file;
+            for (int i = 1; i < pars.Length; i++)
+            {
+                if (pars[i].ParameterType == typeof(ExportOptions)) args[i] = ExportOptions.None;
+                else if (pars[i].HasDefaultValue) args[i] = pars[i].DefaultValue;
+                else args[i] = pars[i].ParameterType.IsValueType ? Activator.CreateInstance(pars[i].ParameterType) : null;
+            }
+            method.Invoke(screen, args);
+        }
+
+        // Reads the ScreenItems tree of an HMI screen (works for WinCC Unified via the object model)
+        // and returns an indented text dump including item types, key attributes and Dynamizations (tag links).
+        public string GetHmiScreenItems(string softwarePath, string screenName)
+        {
+            if (IsProjectNull())
+            {
+                return "ERROR: no project open";
+            }
+
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+
+                var screen = FindHmiScreen(software, screenName);
+                if (screen == null) return $"ERROR: HMI screen not found: {screenName}";
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Screen '{screenName}' [{screen.GetType().FullName}]");
+                DumpScreenObject(screen, sb, 1);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "GetHmiScreenItems failed for {SoftwarePath} {ScreenName}", softwarePath, screenName);
+                return "ERROR: " + ex.Message;
+            }
+        }
+
+        private static readonly string[] _hmiKeyAttrNames =
+            { "Name", "Left", "Top", "Width", "Height", "Text", "Caption", "Visible", "ProcessValue", "Tag", "Content", "ToolTipText" };
+
+        // Recursively dumps an HMI engineering object: its key attributes, Dynamizations (tag bindings),
+        // EventHandlers, and any nested ScreenItems composition.
+        private void DumpHmiObject(object obj, StringBuilder sb, int depth)
+        {
+            if (obj == null || depth > 8) return;
+            var pad = new string(' ', depth * 2);
+            var type = obj.GetType();
+
+            // Name
+            string name = "";
+            try { name = type.GetProperty("Name")?.GetValue(obj) as string ?? ""; } catch { }
+            sb.AppendLine($"{pad}- {type.Name} \"{name}\"");
+
+            // Key attributes via Openness GetAttribute
+            var getAttr = type.GetMethod("GetAttribute", new[] { typeof(string) });
+            if (getAttr != null)
+            {
+                foreach (var an in _hmiKeyAttrNames)
+                {
+                    try
+                    {
+                        var v = getAttr.Invoke(obj, new object[] { an });
+                        if (v != null)
+                        {
+                            var s = v.ToString();
+                            if (!string.IsNullOrEmpty(s)) sb.AppendLine($"{pad}    .{an} = {s}");
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            // Dynamizations (tag / expression bindings = the PLC link)
+            DumpHmiSubComposition(obj, "Dynamizations", sb, depth);
+            // Event handlers (scripts / system functions)
+            DumpHmiSubComposition(obj, "EventHandlers", sb, depth);
+            // Script code inside event handlers and script dynamizations (may hold hard-coded tag names)
+            DumpScripts(obj, sb, depth);
+
+            // For faceplate containers: dump the faceplate type and its interface assignments (tag links)
+            if (type.Name.IndexOf("Faceplate", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                DumpFaceplateDetails(obj, sb, depth);
+            }
+        }
+
+        // Dumps the script code held by an item's event handlers (EventHandler.Script.ScriptCode)
+        // and any script dynamizations (ScriptDynamization.ScriptCode) - truncated for readability.
+        private void DumpScripts(object obj, StringBuilder sb, int depth)
+        {
+            var pad = new string(' ', depth * 2);
+            // event handler scripts
+            foreach (var eh in Snapshot(obj.GetType().GetProperty("EventHandlers")?.GetValue(obj)))
+            {
+                var script = eh.GetType().GetProperty("Script")?.GetValue(eh);
+                if (script == null) continue;
+                foreach (var sp in new[] { "ScriptCode", "GlobalDefinitionAreaScriptCode" })
+                {
+                    var code = script.GetType().GetProperty(sp)?.GetValue(script) as string;
+                    if (!string.IsNullOrWhiteSpace(code))
+                        sb.AppendLine($"{pad}    [script:{eh.GetType().Name}.{sp}] {Trunc(code, 300)}");
+                }
+            }
+            // script dynamizations
+            foreach (var d in Snapshot(obj.GetType().GetProperty("Dynamizations")?.GetValue(obj)))
+            {
+                if (d.GetType().Name.IndexOf("Script", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var code = d.GetType().GetProperty("ScriptCode")?.GetValue(d) as string;
+                if (!string.IsNullOrWhiteSpace(code))
+                    sb.AppendLine($"{pad}    [scriptDyn.ScriptCode] {Trunc(code, 300)}");
+            }
+        }
+
+        private static string Trunc(string s, int n)
+        {
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            return s.Length <= n ? s : s.Substring(0, n) + " …";
+        }
+
+        // Dumps the faceplate type and interface property assignments of an HmiFaceplateContainer.
+        // The interface assignments are how the faceplate's interface members are bound to HMI tags / values.
+        private void DumpFaceplateDetails(object obj, StringBuilder sb, int depth)
+        {
+            var pad = new string(' ', depth * 2);
+            var type = obj.GetType();
+
+            // scalar properties that identify the faceplate type
+            foreach (var pn in new[] { "ContainedType", "FaceplateType", "Faceplate", "Version", "AdaptName" })
+            {
+                try
+                {
+                    var v = type.GetProperty(pn)?.GetValue(obj);
+                    if (v != null && !string.IsNullOrEmpty(v.ToString()))
+                        sb.AppendLine($"{pad}    <faceplate> .{pn} = {v}");
+                }
+                catch { }
+            }
+
+            // interface assignments: enumerate any composition-like property and dump child name/value/tag
+            foreach (var prop in type.GetProperties())
+            {
+                object? val;
+                try { val = prop.GetValue(obj); } catch { continue; }
+                if (val is not System.Collections.IEnumerable en || val is string) continue;
+                if (prop.Name == "Dynamizations" || prop.Name == "EventHandlers" || prop.Name == "ScreenItems") continue;
+
+                var rows = new List<string>();
+                foreach (var c in en)
+                {
+                    if (c == null) continue;
+                    var getAttr = c.GetType().GetMethod("GetAttribute", new[] { typeof(string) });
+                    string? nm = null, tg = null, vl = null;
+                    try { nm = getAttr?.Invoke(c, new object[] { "Name" })?.ToString(); } catch { }
+                    try { tg = getAttr?.Invoke(c, new object[] { "Tag" })?.ToString(); } catch { }
+                    try { vl = getAttr?.Invoke(c, new object[] { "Value" })?.ToString(); } catch { }
+                    if (nm == null && tg == null && vl == null)
+                    {
+                        nm = c.GetType().GetProperty("Name")?.GetValue(c) as string;
+                    }
+                    if (nm != null || tg != null || vl != null)
+                        rows.Add($"{pad}        {c.GetType().Name} Name={nm} Tag={tg} Value={vl}");
+                }
+                if (rows.Count > 0)
+                {
+                    sb.AppendLine($"{pad}    [{prop.Name}]");
+                    foreach (var r in rows) sb.AppendLine(r);
+                }
+            }
+        }
+
+        private void DumpHmiSubComposition(object obj, string propName, StringBuilder sb, int depth)
+        {
+            try
+            {
+                var comp = obj.GetType().GetProperty(propName)?.GetValue(obj) as System.Collections.IEnumerable;
+                if (comp == null) return;
+                var pad = new string(' ', depth * 2);
+                foreach (var c in comp)
+                {
+                    if (c == null) continue;
+                    sb.AppendLine($"{pad}    [{propName}] {c.GetType().Name}");
+                    var getAttr = c.GetType().GetMethod("GetAttribute", new[] { typeof(string) });
+                    if (getAttr != null)
+                    {
+                        foreach (var an in new[] { "PropertyName", "Tag", "Expression", "Name", "SourceType", "DynamizationType" })
+                        {
+                            try
+                            {
+                                var v = getAttr.Invoke(c, new object[] { an });
+                                if (v != null && !string.IsNullOrEmpty(v.ToString()))
+                                    sb.AppendLine($"{pad}        .{an} = {v}");
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Dumps a screen (or screen item) and recurses into its ScreenItems composition.
+        private void DumpScreenObject(object obj, StringBuilder sb, int depth)
+        {
+            var itemsObj = obj.GetType().GetProperty("ScreenItems")?.GetValue(obj) as System.Collections.IEnumerable;
+            if (itemsObj == null) return;
+            foreach (var item in itemsObj)
+            {
+                if (item == null) continue;
+                DumpHmiObject(item, sb, depth);
+                // recurse: containers / faceplate instances may hold nested ScreenItems
+                DumpScreenObject(item, sb, depth + 1);
+            }
+        }
+
+        // Lists HMI tags (WinCC Unified) with their connection, PLC tag/address and data type.
+        // Enumerates the default Tags collection plus every tag table (including those nested in tag table groups).
+        public string GetHmiTags(string softwarePath, string regexName = "")
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+
+                var sb = new StringBuilder();
+                int count = 0;
+                AppendHmiTags(software, "(default)", regexName, sb, ref count);
+                foreach (var table in EnumerateTagTables(software))
+                {
+                    var tn = table.GetType().GetProperty("Name")?.GetValue(table) as string ?? "";
+                    AppendHmiTags(table, tn, regexName, sb, ref count);
+                }
+                sb.Insert(0, $"HMI tags in '{softwarePath}' matching '{regexName}': {count}\r\n");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "GetHmiTags failed for {SoftwarePath}", softwarePath);
+                return "ERROR: " + ex.Message;
+            }
+        }
+
+        private IEnumerable<object> EnumerateTagTables(object container)
+        {
+            if (container.GetType().GetProperty("TagTables")?.GetValue(container) is System.Collections.IEnumerable tables)
+            {
+                foreach (var t in tables) { if (t != null) yield return t; }
+            }
+            foreach (var grpProp in new[] { "TagTableGroups", "Groups" })
+            {
+                if (container.GetType().GetProperty(grpProp)?.GetValue(container) is System.Collections.IEnumerable groups)
+                {
+                    foreach (var g in groups)
+                    {
+                        if (g == null) continue;
+                        foreach (var t in EnumerateTagTables(g)) yield return t;
+                    }
+                }
+            }
+        }
+
+        private void AppendHmiTags(object container, string tableName, string regexName, StringBuilder sb, ref int count)
+        {
+            if (container.GetType().GetProperty("Tags")?.GetValue(container) is not System.Collections.IEnumerable tags) return;
+            foreach (var tag in tags)
+            {
+                if (tag == null) continue;
+                var name = ReadHmiProp(tag, "Name");
+                if (string.IsNullOrEmpty(name)) continue;
+                if (!string.IsNullOrEmpty(regexName))
+                {
+                    try { if (!Regex.IsMatch(name, regexName, RegexOptions.IgnoreCase)) continue; }
+                    catch { }
+                }
+                var conn = ReadHmiProp(tag, "Connection");
+                var plcTag = ReadHmiProp(tag, "PlcTag");
+                var addr = ReadHmiProp(tag, "Address");
+                var dt = ReadHmiProp(tag, "DataType");
+                sb.AppendLine($"[{tableName}] {name} | type={dt} | conn={conn} | plcTag={plcTag} | addr={addr}");
+                count++;
+            }
+        }
+
+        // Reads an HMI object property by reflection, returning a readable string (uses .Name for nested objects).
+        private string ReadHmiProp(object obj, string propName)
+        {
+            try
+            {
+                var v = obj.GetType().GetProperty(propName)?.GetValue(obj);
+                if (v == null) return "";
+                var t = v.GetType();
+                if (v is string s) return s;
+                if (t.IsPrimitive || t.IsEnum) return v.ToString();
+                var nm = t.GetProperty("Name")?.GetValue(v) as string;
+                return nm ?? v.ToString();
+            }
+            catch { return ""; }
+        }
+
+        // Proof-of-concept: recreate (clone) a WinCC Unified screen by rebuilding its screen items
+        // via the object model, since Openness offers no screen Copy/Export. Best-effort: copies item
+        // type, attributes and Dynamizations; returns a coverage report so fidelity can be judged.
+        public string CloneHmiScreen(string softwarePath, string srcName, string destName)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+
+                var src = FindHmiScreen(software, srcName);
+                if (src == null) return $"ERROR: source screen not found: {srcName}";
+                if (FindHmiScreen(software, destName) != null) return $"ERROR: destination screen already exists: {destName}";
+
+                var screensComp = software.GetType().GetProperty("Screens")?.GetValue(software);
+                var createScreen = screensComp?.GetType().GetMethod("Create", new[] { typeof(string) });
+                if (createScreen == null) return "ERROR: cannot find Screens.Create(string)";
+                var dest = createScreen.Invoke(screensComp, new object[] { destName });
+
+                var rep = new CloneReport();
+                CopyAttributes(src, dest, rep);            // screen-level attributes (Width, Height, background, ...)
+                CloneScreenItems(src, dest, rep, 0);
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Cloned '{srcName}' -> '{destName}'");
+                sb.AppendLine($"Items created: {rep.ItemsCreated}, item-create failures: {rep.ItemsFailed}");
+                sb.AppendLine($"Attributes copied: {rep.AttrCopied}, skipped/failed: {rep.AttrFailed}");
+                sb.AppendLine($"Dynamizations created: {rep.DynCreated}, failed: {rep.DynFailed}");
+                if (rep.Notes.Count > 0)
+                {
+                    sb.AppendLine("Notes (first 40):");
+                    foreach (var n in rep.Notes.Take(40)) sb.AppendLine("  - " + n);
+                }
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "CloneHmiScreen failed {Src}->{Dest}", srcName, destName);
+                return "ERROR: " + ex.Message;
+            }
+        }
+
+        private class CloneReport
+        {
+            public int ItemsCreated, ItemsFailed, AttrCopied, AttrFailed, DynCreated, DynFailed;
+            public List<string> Notes = new List<string>();
+            public void Note(string s) { if (Notes.Count < 200) Notes.Add(s); }
+        }
+
+        // Snapshots an Openness composition into a list, because holding a live enumerator across a
+        // mutating Create() call disposes the enumerator ("Access to a disposed object ...").
+        private static List<object> Snapshot(object enumerable)
+        {
+            var list = new List<object>();
+            if (enumerable is System.Collections.IEnumerable e)
+                foreach (var x in e) { if (x != null) list.Add(x); }
+            return list;
+        }
+
+        private void CloneScreenItems(object srcContainer, object destContainer, CloneReport rep, int depth)
+        {
+            if (depth > 6) return;
+            var srcItems = Snapshot(srcContainer.GetType().GetProperty("ScreenItems")?.GetValue(srcContainer));
+            var destComp = destContainer.GetType().GetProperty("ScreenItems")?.GetValue(destContainer);
+            if (srcItems.Count == 0 || destComp == null) return;
+
+            // generic Create<T>(string name)
+            var createGen = destComp.GetType().GetMethods()
+                .FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethodDefinition
+                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+            if (createGen == null) { rep.Note("no generic Create<T>(string) on ScreenItems"); return; }
+
+            foreach (var item in srcItems)
+            {
+                if (item == null) continue;
+                var itemType = item.GetType();
+                var name = ReadHmiProp(item, "Name");
+                object newItem;
+                try
+                {
+                    newItem = createGen.MakeGenericMethod(itemType).Invoke(destComp, new object[] { name });
+                    rep.ItemsCreated++;
+                }
+                catch (Exception ex)
+                {
+                    rep.ItemsFailed++;
+                    rep.Note($"create {itemType.Name} '{name}' failed: {ex.InnerException?.Message ?? ex.Message}");
+                    continue;
+                }
+
+                CopyAttributes(item, newItem, rep);
+                CloneDynamizations(item, newItem, rep);
+                // recurse into nested ScreenItems (containers)
+                CloneScreenItems(item, newItem, rep, depth + 1);
+            }
+        }
+
+        private static readonly HashSet<string> _cloneSkipAttrs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "Name", "Parent" };
+
+        private void CopyAttributes(object src, object dest, CloneReport rep)
+        {
+            var infosM = src.GetType().GetMethod("GetAttributeInfos", Type.EmptyTypes);
+            if (infosM == null) return;
+            object infosObj;
+            try { infosObj = infosM.Invoke(src, null); } catch { return; }
+            var infos = Snapshot(infosObj);
+
+            var getA = src.GetType().GetMethod("GetAttribute", new[] { typeof(string) });
+            var setA = dest.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) });
+            if (getA == null || setA == null) return;
+
+            foreach (var info in infos)
+            {
+                if (info == null) continue;
+                var an = info.GetType().GetProperty("Name")?.GetValue(info) as string;
+                if (string.IsNullOrEmpty(an) || _cloneSkipAttrs.Contains(an)) continue;
+                try
+                {
+                    var val = getA.Invoke(src, new object[] { an });
+                    if (val == null) continue;
+                    setA.Invoke(dest, new object[] { an, val });
+                    rep.AttrCopied++;
+                }
+                catch (Exception ex)
+                {
+                    rep.AttrFailed++;
+                    rep.Note($"attr '{an}' on {src.GetType().Name}: {ex.InnerException?.Message ?? ex.Message}");
+                }
+            }
+        }
+
+        private void CloneDynamizations(object src, object dest, CloneReport rep)
+        {
+            var srcDyn = Snapshot(src.GetType().GetProperty("Dynamizations")?.GetValue(src));
+            var destDynComp = dest.GetType().GetProperty("Dynamizations")?.GetValue(dest);
+            if (srcDyn.Count == 0 || destDynComp == null) return;
+
+            var createGen = destDynComp.GetType().GetMethods()
+                .FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethodDefinition
+                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
+            if (createGen == null) return;
+
+            foreach (var d in srcDyn)
+            {
+                if (d == null) continue;
+                var dtype = d.GetType();
+                var propName = ReadHmiProp(d, "PropertyName");
+                try
+                {
+                    var newD = createGen.MakeGenericMethod(dtype).Invoke(destDynComp, new object[] { propName });
+                    CopyAttributes(d, newD, rep);
+                    rep.DynCreated++;
+                }
+                catch (Exception ex)
+                {
+                    rep.DynFailed++;
+                    rep.Note($"dyn {dtype.Name} on '{propName}': {ex.InnerException?.Message ?? ex.Message}");
+                }
+            }
+        }
+
+        // Finds an HMI tag table by name (searches default-less: tables + nested groups). Returns the table object or null.
+        private object? FindHmiTagTable(object software, string tableName)
+        {
+            foreach (var t in EnumerateTagTables(software))
+            {
+                var n = t.GetType().GetProperty("Name")?.GetValue(t) as string;
+                if (string.Equals(n, tableName, StringComparison.OrdinalIgnoreCase)) return t;
+            }
+            return null;
+        }
+
+        // Exports an HMI tag table's tags to a directory (WinCC Unified HmiTagComposition.Export).
+        public string ExportHmiTags(string softwarePath, string tableName, string exportDir)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var table = FindHmiTagTable(software, tableName);
+                if (table == null) return $"ERROR: tag table not found: {tableName}";
+                var tagsComp = table.GetType().GetProperty("Tags")?.GetValue(table);
+                if (tagsComp == null) return "ERROR: table has no Tags composition";
+                if (!Directory.Exists(exportDir)) Directory.CreateDirectory(exportDir);
+                var exportM = tagsComp.GetType().GetMethod("Export", new[] { typeof(DirectoryInfo) });
+                if (exportM == null) return "ERROR: no Export(DirectoryInfo) on tag composition";
+                exportM.Invoke(tagsComp, new object[] { new DirectoryInfo(exportDir) });
+                return $"OK: exported tags of '{tableName}' to '{exportDir}'";
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "ExportHmiTags failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        // Imports HMI tags into a tag table from a directory (WinCC Unified HmiTagComposition.Import).
+        public string ImportHmiTags(string softwarePath, string tableName, string importDir)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var table = FindHmiTagTable(software, tableName);
+                if (table == null) return $"ERROR: tag table not found: {tableName}";
+                var tagsComp = table.GetType().GetProperty("Tags")?.GetValue(table);
+                if (tagsComp == null) return "ERROR: table has no Tags composition";
+                var importM = tagsComp.GetType().GetMethods()
+                    .FirstOrDefault(m => m.Name == "Import" && m.GetParameters().Length >= 1
+                        && m.GetParameters()[0].ParameterType == typeof(DirectoryInfo));
+                if (importM == null) return "ERROR: no Import(DirectoryInfo) on tag composition";
+                var pars = importM.GetParameters();
+                var args = new object?[pars.Length];
+                args[0] = new DirectoryInfo(importDir);
+                for (int i = 1; i < pars.Length; i++)
+                {
+                    if (pars[i].ParameterType == typeof(ImportOptions)) args[i] = ImportOptions.Override;
+                    else if (pars[i].HasDefaultValue) args[i] = pars[i].DefaultValue;
+                    else args[i] = pars[i].ParameterType.IsValueType ? Activator.CreateInstance(pars[i].ParameterType) : null;
+                }
+                importM.Invoke(tagsComp, args);
+                return $"OK: imported tags into '{tableName}' from '{importDir}'";
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "ImportHmiTags failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        // Repoints tag bindings on a screen: in every screen item, replaces 'find' with 'replace' inside
+        // TagDynamization.Tag values and faceplate interface Value entries. No item creation (safe).
+        public string RepointScreenBindings(string softwarePath, string screenName, string find, string replace)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var screen = FindHmiScreen(software, screenName);
+                if (screen == null) return $"ERROR: screen not found: {screenName}";
+                var rep = new CloneReport();
+                RepointItems(screen, find, replace, rep, 0);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Repoint '{screenName}': '{find}' -> '{replace}'");
+                sb.AppendLine($"Bindings changed: {rep.DynCreated}, failures: {rep.DynFailed}");
+                foreach (var n in rep.Notes.Take(60)) sb.AppendLine("  " + n);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "RepointScreenBindings failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        private void RepointItems(object container, string find, string replace, CloneReport rep, int depth)
+        {
+            if (depth > 6) return;
+            foreach (var item in Snapshot(container.GetType().GetProperty("ScreenItems")?.GetValue(container)))
+            {
+                // 1) plain tag dynamizations + script dynamizations
+                foreach (var d in Snapshot(item.GetType().GetProperty("Dynamizations")?.GetValue(item)))
+                {
+                    RepointAttribute(d, "Tag", find, replace, rep);
+                    RepointStringProp(d, "ScriptCode", find, replace, rep);
+                }
+                // 1b) event handler scripts (button clicks etc.) - Script.ScriptCode holds hard-coded tag writes / nav targets
+                foreach (var eh in Snapshot(item.GetType().GetProperty("EventHandlers")?.GetValue(item)))
+                {
+                    var script = eh.GetType().GetProperty("Script")?.GetValue(eh);
+                    if (script == null) continue;
+                    RepointStringProp(script, "ScriptCode", find, replace, rep);
+                    RepointStringProp(script, "GlobalDefinitionAreaScriptCode", find, replace, rep);
+                }
+                // 2) faceplate interface entries (Value holds the tag name)
+                if (item.GetType().Name.IndexOf("Faceplate", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    foreach (var prop in item.GetType().GetProperties())
+                    {
+                        object? val; try { val = prop.GetValue(item); } catch { continue; }
+                        if (val is not System.Collections.IEnumerable en || val is string) continue;
+                        if (prop.Name is "Dynamizations" or "EventHandlers" or "ScreenItems") continue;
+                        foreach (var entry in Snapshot(en))
+                        {
+                            RepointAttribute(entry, "Value", find, replace, rep);
+                        }
+                    }
+                }
+                // recurse
+                RepointItems(item, find, replace, rep, depth + 1);
+            }
+        }
+
+        private void RepointAttribute(object obj, string attrName, string find, string replace, CloneReport rep)
+        {
+            var getA = obj.GetType().GetMethod("GetAttribute", new[] { typeof(string) });
+            var setA = obj.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) });
+            if (getA == null || setA == null) return;
+            try
+            {
+                var cur = getA.Invoke(obj, new object[] { attrName }) as string;
+                if (string.IsNullOrEmpty(cur) || !cur.Contains(find)) return;
+                var next = cur.Replace(find, replace);
+                setA.Invoke(obj, new object[] { attrName, next });
+                rep.DynCreated++;
+                rep.Note($"{obj.GetType().Name}.{attrName}: {cur} -> {next}");
+            }
+            catch (Exception ex)
+            {
+                rep.DynFailed++;
+                rep.Note($"{obj.GetType().Name}.{attrName} failed: {ex.InnerException?.Message ?? ex.Message}");
+            }
+        }
+
+        // Repoints a writable string PROPERTY (e.g. IHmiScript.ScriptCode, ScriptDynamization.ScriptCode)
+        // by replacing 'find' with 'replace'. Used for button/event scripts that hold hard-coded tag names.
+        private void RepointStringProp(object obj, string propName, string find, string replace, CloneReport rep)
+        {
+            try
+            {
+                var p = obj.GetType().GetProperty(propName);
+                if (p == null || !p.CanRead || !p.CanWrite) return;
+                if (p.GetValue(obj) is not string cur || string.IsNullOrEmpty(cur) || !cur.Contains(find)) return;
+                p.SetValue(obj, cur.Replace(find, replace));
+                rep.DynCreated++;
+                rep.Note($"{obj.GetType().Name}.{propName}: repointed ({CountOcc(cur, find)}x)");
+            }
+            catch (Exception ex)
+            {
+                rep.DynFailed++;
+                rep.Note($"{obj.GetType().Name}.{propName} failed: {ex.InnerException?.Message ?? ex.Message}");
+            }
+        }
+
+        private static int CountOcc(string s, string sub)
+        {
+            int c = 0, i = 0;
+            while ((i = s.IndexOf(sub, i, StringComparison.Ordinal)) >= 0) { c++; i += sub.Length; }
+            return c;
         }
 
         #endregion
@@ -3321,72 +4124,86 @@ namespace TiaMcpServer.Siemens
 
         private PlcBlockGroup? GetPlcBlockGroupByPath(string softwarePath, string groupPath)
         {
-            if (_project == null)
-            {
-                return null;
-            }
+            if (_project == null) return null;
 
             var softwareContainer = GetSoftwareContainer(softwarePath);
             if (softwareContainer?.Software is PlcSoftware plcSoftware)
             {
-                if (plcSoftware?.BlockGroup == null)
+                if (plcSoftware?.BlockGroup == null) return null;
+                if (string.IsNullOrEmpty(groupPath)) return plcSoftware.BlockGroup;
+                return FindBlockGroupByPath(plcSoftware.BlockGroup, groupPath);
+            }
+            return null;
+        }
+
+        private PlcBlockGroup? FindBlockGroupByPath(PlcBlockGroup parent, string remainingPath)
+        {
+            if (string.IsNullOrEmpty(remainingPath)) return parent;
+
+            PlcBlockGroup? bestMatch = null;
+            string? bestRemaining = null;
+
+            foreach (PlcBlockGroup child in parent.Groups)
+            {
+                if (remainingPath.Equals(child.Name, StringComparison.OrdinalIgnoreCase))
+                    return child;
+
+                if (remainingPath.StartsWith(child.Name + "/", StringComparison.OrdinalIgnoreCase))
                 {
-                    return null;
-                }
-
-
-                // Split the path by '/' to get each group name
-                var groupNames = groupPath.Split(['/'], StringSplitOptions.RemoveEmptyEntries);
-
-                PlcBlockGroup? currentGroup = plcSoftware.BlockGroup;
-
-                foreach (var groupName in groupNames)
-                {
-                    currentGroup = currentGroup.Groups.FirstOrDefault(g => g.Name.Equals(groupName, StringComparison.OrdinalIgnoreCase));
-
-                    if (currentGroup == null)
+                    var subPath = remainingPath.Substring(child.Name.Length + 1);
+                    if (bestMatch == null || child.Name.Length > bestMatch.Name.Length)
                     {
-                        return null;
+                        bestMatch = child;
+                        bestRemaining = subPath;
                     }
                 }
-
-                return currentGroup;
             }
+
+            if (bestMatch != null)
+                return FindBlockGroupByPath(bestMatch, bestRemaining!);
 
             return null;
         }
 
         private PlcTypeGroup? GetPlcTypeGroupByPath(string softwarePath, string groupPath)
         {
-            if (_project == null)
-            {
-                return null;
-            }
+            if (_project == null) return null;
 
             var softwareContainer = GetSoftwareContainer(softwarePath);
             if (softwareContainer?.Software is PlcSoftware plcSoftware)
             {
-                if (plcSoftware?.TypeGroup == null)
+                if (plcSoftware?.TypeGroup == null) return null;
+                if (string.IsNullOrEmpty(groupPath)) return plcSoftware.TypeGroup;
+                return FindTypeGroupByPath(plcSoftware.TypeGroup, groupPath);
+            }
+            return null;
+        }
+
+        private PlcTypeGroup? FindTypeGroupByPath(PlcTypeGroup parent, string remainingPath)
+        {
+            if (string.IsNullOrEmpty(remainingPath)) return parent;
+
+            PlcTypeGroup? bestMatch = null;
+            string? bestRemaining = null;
+
+            foreach (PlcTypeGroup child in parent.Groups)
+            {
+                if (remainingPath.Equals(child.Name, StringComparison.OrdinalIgnoreCase))
+                    return child;
+
+                if (remainingPath.StartsWith(child.Name + "/", StringComparison.OrdinalIgnoreCase))
                 {
-                    return null;
-                }
-
-                var groupNames = groupPath.Split(['/'], StringSplitOptions.RemoveEmptyEntries);
-
-                PlcTypeGroup? currentGroup = plcSoftware.TypeGroup;
-
-                foreach (var groupName in groupNames)
-                {
-                    currentGroup = currentGroup.Groups.FirstOrDefault(g => g.Name.Equals(groupName, StringComparison.OrdinalIgnoreCase));
-
-                    if (currentGroup == null)
+                    var subPath = remainingPath.Substring(child.Name.Length + 1);
+                    if (bestMatch == null || child.Name.Length > bestMatch.Name.Length)
                     {
-                        return null;
+                        bestMatch = child;
+                        bestRemaining = subPath;
                     }
                 }
-
-                return currentGroup;
             }
+
+            if (bestMatch != null)
+                return FindTypeGroupByPath(bestMatch, bestRemaining!);
 
             return null;
         }
