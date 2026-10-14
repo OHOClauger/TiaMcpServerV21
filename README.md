@@ -69,7 +69,7 @@ dotnet build -c Release
 # Output: src/TiaMcpServer/bin/Release/net48/TiaMcpServer.exe
 ```
 
-## Available Tools (68)
+## Available Tools (70)
 
 ### Connection & State
 
@@ -156,8 +156,10 @@ dotnet build -c Release
 | `GetHmiScreenItems` | Get a screen's items/objects tree, incl. attributes and tag/PLC dynamizations |
 | `ExportHmiScreen` | Export an HMI screen |
 | `ImportHmiScreen` | Import an HMI screen |
-| `CloneHmiScreen` | Proof-of-concept: recreate a WinCC Unified screen via the object model (no native Copy in Openness) |
+| `CloneHmiScreen` | Clone a WinCC Unified screen via the object model (items, dynamizations, scripts, faceplate values, thresholds; optional destination group) |
+| `CloneHmiScreenGroup` | Clone every screen of a WinCC Unified screen group into a new/existing group, with prefix rename |
 | `RepointScreenBindings` | Replace a tag/faceplate binding value across a screen's dynamizations |
+| `CreateHmiConnection` | Create the integrated HMI/PLC hardware connection so HMI tags can bind PLC tags symbolically |
 | `GetHmiTags` | List HMI tags (WinCC Unified) with connection, PLC tag/address and data type |
 | `ExportHmiTags` | Export an HMI tag table's tags to XML (WinCC Unified) |
 | `ImportHmiTags` | Import HMI tags into a tag table (WinCC Unified, override) |

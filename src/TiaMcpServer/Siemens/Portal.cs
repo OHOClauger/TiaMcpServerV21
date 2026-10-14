@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 using Siemens.Engineering;
 using Siemens.Engineering.Compiler;
 using Siemens.Engineering.Hmi;
@@ -1707,10 +1707,13 @@ namespace TiaMcpServer.Siemens
             catch { return ""; }
         }
 
-        // Proof-of-concept: recreate (clone) a WinCC Unified screen by rebuilding its screen items
-        // via the object model, since Openness offers no screen Copy/Export. Best-effort: copies item
-        // type, attributes and Dynamizations; returns a coverage report so fidelity can be judged.
-        public string CloneHmiScreen(string softwarePath, string srcName, string destName)
+        // Clones a WinCC Unified screen by rebuilding it through the object model (Openness has no screen Copy/Export).
+        // Copies: every writable scalar property (incl. System.Drawing.Color), Part objects (Font, Padding, InputBehavior...),
+        // multilingual texts, dynamizations (tag/resource-list/script) with value converters and mapping tables,
+        // event-handler scripts, faceplate interface values and IO-field thresholds. Items are created in source order (z-order).
+        // NOT copied: HmiCustomWidgetContainer (contained type is not exposed by Openness) -> reported, add by hand.
+        // Safety: the cloner never writes read-only objects and never copies ValueConverter by reference (that crashed TIA Portal before).
+        public string CloneHmiScreen(string softwarePath, string srcName, string destName, string? destGroupName = null)
         {
             if (IsProjectNull()) return "ERROR: no project open";
             try
@@ -1722,31 +1725,164 @@ namespace TiaMcpServer.Siemens
                 if (src == null) return $"ERROR: source screen not found: {srcName}";
                 if (FindHmiScreen(software, destName) != null) return $"ERROR: destination screen already exists: {destName}";
 
-                var screensComp = software.GetType().GetProperty("Screens")?.GetValue(software);
-                var createScreen = screensComp?.GetType().GetMethod("Create", new[] { typeof(string) });
-                if (createScreen == null) return "ERROR: cannot find Screens.Create(string)";
-                var dest = createScreen.Invoke(screensComp, new object[] { destName });
-
-                var rep = new CloneReport();
-                CopyAttributes(src, dest, rep);            // screen-level attributes (Width, Height, background, ...)
-                CloneScreenItems(src, dest, rep, 0);
-
-                var sb = new StringBuilder();
-                sb.AppendLine($"Cloned '{srcName}' -> '{destName}'");
-                sb.AppendLine($"Items created: {rep.ItemsCreated}, item-create failures: {rep.ItemsFailed}");
-                sb.AppendLine($"Attributes copied: {rep.AttrCopied}, skipped/failed: {rep.AttrFailed}");
-                sb.AppendLine($"Dynamizations created: {rep.DynCreated}, failed: {rep.DynFailed}");
-                if (rep.Notes.Count > 0)
+                object container = software;
+                if (!string.IsNullOrEmpty(destGroupName))
                 {
-                    sb.AppendLine("Notes (first 40):");
-                    foreach (var n in rep.Notes.Take(40)) sb.AppendLine("  - " + n);
+                    var g = FindHmiScreenGroup(software, destGroupName!);
+                    if (g == null) return $"ERROR: destination screen group not found: {destGroupName}";
+                    container = g;
                 }
-                return sb.ToString();
+                else
+                {
+                    // same container as the source (root or group)
+                    var parent = src.GetType().GetProperty("Parent")?.GetValue(src);
+                    if (parent != null && parent.GetType().GetProperty("Screens") != null) container = parent;
+                }
+
+                var cloner = new ScreenCloner(_logger);
+                cloner.CloneScreen(src, container, destName);
+                return cloner.Report($"Cloned '{srcName}' -> '{destName}'");
             }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "CloneHmiScreen failed {Src}->{Dest}", srcName, destName);
-                return "ERROR: " + ex.Message;
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        // Clones every screen of a screen group into a (new) screen group. Screen names starting with oldPrefix get newPrefix
+        // (e.g. 10 -> 11: "1010_Overview" -> "1110_Overview"); other names get the suffix "_copy".
+        public string CloneHmiScreenGroup(string softwarePath, string srcGroupName, string destGroupName, string oldPrefix, string newPrefix)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var sg = FindHmiScreenGroup(software, srcGroupName);
+                if (sg == null) return $"ERROR: source screen group not found: {srcGroupName}";
+                var dg = FindHmiScreenGroup(software, destGroupName);
+                if (dg == null)
+                {
+                    var comp = software.GetType().GetProperty("ScreenGroups")?.GetValue(software);
+                    var create = comp?.GetType().GetMethod("Create", new[] { typeof(string) });
+                    if (create == null) return "ERROR: cannot create screen group";
+                    dg = create.Invoke(comp, new object[] { destGroupName });
+                }
+                var cloner = new ScreenCloner(_logger);
+                var sb = new StringBuilder();
+                foreach (var s in Snapshot(sg.GetType().GetProperty("Screens")?.GetValue(sg)))
+                {
+                    var n = ReadHmiProp(s, "Name");
+                    var dn = !string.IsNullOrEmpty(oldPrefix) && n.StartsWith(oldPrefix) ? newPrefix + n.Substring(oldPrefix.Length) : n + "_copy";
+                    if (FindHmiScreen(software, dn) != null) { sb.AppendLine($"  skip '{n}': '{dn}' already exists"); continue; }
+                    var before = cloner.ItemsCreated + cloner.ItemsFailed;
+                    cloner.CloneScreen(s, dg!, dn);
+                    sb.AppendLine($"  '{n}' -> '{dn}': {cloner.ItemsCreated + cloner.ItemsFailed - before} items processed");
+                }
+                return cloner.Report($"Cloned screen group '{srcGroupName}' -> '{destGroupName}' ({oldPrefix}->{newPrefix})") + sb;
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "CloneHmiScreenGroup failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        // Finds a screen group by name (recursive over ScreenGroups/Groups).
+        private object? FindHmiScreenGroup(object software, string name)
+        {
+            object? Walk(object groups)
+            {
+                foreach (var g in Snapshot(groups))
+                {
+                    if (string.Equals(ReadHmiProp(g, "Name"), name, StringComparison.OrdinalIgnoreCase)) return g;
+                    var sub = g.GetType().GetProperty("Groups")?.GetValue(g);
+                    if (sub != null) { var r = Walk(sub); if (r != null) return r; }
+                }
+                return null;
+            }
+            var root = software.GetType().GetProperty("ScreenGroups")?.GetValue(software);
+            return root == null ? null : Walk(root);
+        }
+
+        // Creates an integrated HMI connection (HMI runtime <-> PLC CPU) at hardware level, which gives the WinCC Unified
+        // connection its Partner/Station/Node (these are read-only on HmiUnified.HmiConnection, so HmiConnections.Create(name)
+        // alone leaves them empty and symbolic PlcTag bindings cannot resolve). The CPU's CommunicationManagement creates the
+        // connection towards the HMI runtime device item. Both devices must already be on the same subnet.
+        public string CreateHmiConnection(string hmiDevicePath, string plcDevicePath, string newConnectionName = "")
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var hmiDev = GetDeviceByPath(hmiDevicePath);
+                var plcDev = GetDeviceByPath(plcDevicePath);
+                if (hmiDev == null) return $"ERROR: HMI device not found: {hmiDevicePath}";
+                if (plcDev == null) return $"ERROR: PLC device not found: {plcDevicePath}";
+
+                DeviceItem? FindWithSoftware(DeviceItem it, Func<object, bool> isWanted)
+                {
+                    var sc = it.GetService<SoftwareContainer>();
+                    if (sc?.Software != null && isWanted(sc.Software)) return it;
+                    foreach (var c in it.DeviceItems) { var r = FindWithSoftware(c, isWanted); if (r != null) return r; }
+                    return null;
+                }
+                DeviceItem? FindIn(Device d, Func<object, bool> isWanted)
+                {
+                    foreach (var it in d.DeviceItems) { var r = FindWithSoftware(it, isWanted); if (r != null) return r; }
+                    return null;
+                }
+                Node? FirstNode(DeviceItem it)
+                {
+                    var ni = it.GetService<NetworkInterface>();
+                    if (ni != null && ni.Nodes.Count > 0) return ni.Nodes[0];
+                    foreach (var c in it.DeviceItems) { var r = FirstNode(c); if (r != null) return r; }
+                    return null;
+                }
+                Node? FirstNodeOfDevice(Device d)
+                {
+                    foreach (var it in d.DeviceItems) { var r = FirstNode(it); if (r != null) return r; }
+                    return null;
+                }
+
+                var cpuItem = FindIn(plcDev, s => s is PlcSoftware);
+                var hmiSwItem = FindIn(hmiDev, s => s.GetType().Name.StartsWith("Hmi") || s.GetType().Namespace?.Contains("Hmi") == true);
+                if (cpuItem == null) return "ERROR: no PLC software (CPU item) found in " + plcDevicePath;
+                if (hmiSwItem == null) return "ERROR: no HMI runtime software item found in " + hmiDevicePath;
+                var cpuNode = FirstNodeOfDevice(plcDev); var hmiNode = FirstNodeOfDevice(hmiDev);
+                if (cpuNode == null || hmiNode == null) return "ERROR: network interface node not found (connect both devices to a subnet first)";
+
+                var cm = cpuItem.GetService<CommunicationManagement>();
+                if (cm == null) return "ERROR: CPU has no CommunicationManagement service";
+                var conn = cm.Connections.Create<global::Siemens.Engineering.HW.CommunicationConnections.HmiConnection>(cpuNode, hmiSwItem, hmiNode);
+
+                // rename the new WinCC Unified connection if requested
+                var sb = new StringBuilder();
+                var hmiSw = hmiSwItem.GetService<SoftwareContainer>()?.Software;
+                var comp = hmiSw?.GetType().GetProperty("Connections")?.GetValue(hmiSw);
+                string created = "";
+                if (comp is System.Collections.IEnumerable en)
+                {
+                    foreach (var c in en)
+                    {
+                        var partnerItem = ReadHmiProp(c, "Partner");
+                        if (partnerItem == cpuItem.Name && ReadHmiProp(c, "Name").StartsWith("HMI_Liaison"))
+                        {
+                            created = ReadHmiProp(c, "Name");
+                            if (!string.IsNullOrEmpty(newConnectionName))
+                                c.GetType().GetProperty("Name")?.SetValue(c, newConnectionName);
+                        }
+                    }
+                }
+                sb.AppendLine($"OK: HMI connection created between '{hmiDevicePath}' and '{plcDevicePath}' (CPU '{cpuItem.Name}').");
+                if (!string.IsNullOrEmpty(created)) sb.AppendLine($"WinCC connection: '{(string.IsNullOrEmpty(newConnectionName) ? created : newConnectionName)}' (Partner='{cpuItem.Name}').");
+                sb.AppendLine("Note: calling this twice creates a duplicate connection; delete extras with the HMI connection Delete().");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "CreateHmiConnection failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
             }
         }
 
@@ -1767,105 +1903,248 @@ namespace TiaMcpServer.Siemens
             return list;
         }
 
-        private void CloneScreenItems(object srcContainer, object destContainer, CloneReport rep, int depth)
+        // ---- Screen cloner engine (reflection over the WinCC Unified object model) ----
+        private class ScreenCloner
         {
-            if (depth > 6) return;
-            var srcItems = Snapshot(srcContainer.GetType().GetProperty("ScreenItems")?.GetValue(srcContainer));
-            var destComp = destContainer.GetType().GetProperty("ScreenItems")?.GetValue(destContainer);
-            if (srcItems.Count == 0 || destComp == null) return;
+            private readonly ILogger? _log;
+            public int ItemsCreated, ItemsFailed, PropsCopied, PropsFailed, DynCreated, DynFailed, EhCreated, EhFailed;
+            private readonly List<string> _notes = new List<string>();
 
-            // generic Create<T>(string name)
-            var createGen = destComp.GetType().GetMethods()
-                .FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethodDefinition
-                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
-            if (createGen == null) { rep.Note("no generic Create<T>(string) on ScreenItems"); return; }
-
-            foreach (var item in srcItems)
+            // Properties that are never copied: identity, collections handled explicitly, unique numbers, read-only runtime state,
+            // and ValueConverter (copied member-by-member, never by reference).
+            private static readonly HashSet<string> Skip = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             {
-                if (item == null) continue;
-                var itemType = item.GetType();
-                var name = ReadHmiProp(item, "Name");
-                object newItem;
-                try
-                {
-                    newItem = createGen.MakeGenericMethod(itemType).Invoke(destComp, new object[] { name });
-                    rep.ItemsCreated++;
-                }
-                catch (Exception ex)
-                {
-                    rep.ItemsFailed++;
-                    rep.Note($"create {itemType.Name} '{name}' failed: {ex.InnerException?.Message ?? ex.Message}");
-                    continue;
-                }
+                "Name", "Parent", "Dynamizations", "PropertyEventHandlers", "EventHandlers", "ScreenItems", "Interface",
+                "Thresholds", "ContainedType", "ScreenNumber", "DisplayName", "CurrentQuality", "ValueConverter"
+            };
 
-                CopyAttributes(item, newItem, rep);
-                CloneDynamizations(item, newItem, rep);
-                // recurse into nested ScreenItems (containers)
-                CloneScreenItems(item, newItem, rep, depth + 1);
+            public ScreenCloner(ILogger? log) { _log = log; }
+
+            private void Note(string s) { if (_notes.Count < 60) _notes.Add(s); }
+            private static string Msg(Exception e)
+            {
+                while (e.InnerException != null && e is System.Reflection.TargetInvocationException) e = e.InnerException;
+                return e.Message.Replace("\r", " ").Replace("\n", " ");
             }
-        }
 
-        private static readonly HashSet<string> _cloneSkipAttrs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { "Name", "Parent" };
-
-        private void CopyAttributes(object src, object dest, CloneReport rep)
-        {
-            var infosM = src.GetType().GetMethod("GetAttributeInfos", Type.EmptyTypes);
-            if (infosM == null) return;
-            object infosObj;
-            try { infosObj = infosM.Invoke(src, null); } catch { return; }
-            var infos = Snapshot(infosObj);
-
-            var getA = src.GetType().GetMethod("GetAttribute", new[] { typeof(string) });
-            var setA = dest.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) });
-            if (getA == null || setA == null) return;
-
-            foreach (var info in infos)
+            private static List<object> Snap(object? en)
             {
-                if (info == null) continue;
-                var an = info.GetType().GetProperty("Name")?.GetValue(info) as string;
-                if (string.IsNullOrEmpty(an) || _cloneSkipAttrs.Contains(an)) continue;
-                try
+                var l = new List<object>();
+                if (en is System.Collections.IEnumerable e) foreach (var x in e) if (x != null) l.Add(x);
+                return l;
+            }
+
+            private static bool Simple(object? v)
+            {
+                if (v == null) return false;
+                var t = v.GetType();
+                return t.IsPrimitive || t.IsEnum || t == typeof(string) || t == typeof(System.Drawing.Color) || t == typeof(decimal);
+            }
+
+            private static object? Get(object o, string prop) { try { return o.GetType().GetProperty(prop)?.GetValue(o); } catch { return null; } }
+
+            public void CloneScreen(object src, object container, string destName)
+            {
+                var screens = container.GetType().GetProperty("Screens")?.GetValue(container);
+                var create = screens?.GetType().GetMethod("Create", new[] { typeof(string) });
+                if (create == null) throw new InvalidOperationException("cannot find Screens.Create(string) on the destination container");
+                var dest = create.Invoke(screens, new object[] { destName })!;
+                CopyProps(src, dest, "screen");
+                CopyDyn(src, dest, "screen");
+                CopyEventHandlers(src, dest, "screen");
+                CloneItems(src, dest, "", 0);
+            }
+
+            public string Report(string title)
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine(title);
+                sb.AppendLine($"Items created: {ItemsCreated}, item-create failures: {ItemsFailed}");
+                sb.AppendLine($"Properties copied: {PropsCopied}, failed: {PropsFailed}");
+                sb.AppendLine($"Dynamizations created: {DynCreated}, failed: {DynFailed}");
+                sb.AppendLine($"Event handlers created: {EhCreated}, failed: {EhFailed}");
+                if (_notes.Count > 0)
                 {
-                    var val = getA.Invoke(src, new object[] { an });
-                    if (val == null) continue;
-                    setA.Invoke(dest, new object[] { an, val });
-                    rep.AttrCopied++;
+                    sb.AppendLine("Notes:");
+                    foreach (var n in _notes) sb.AppendLine("  - " + n);
                 }
-                catch (Exception ex)
+                return sb.ToString();
+            }
+
+            private void CopyProps(object s, object d, string path)
+            {
+                foreach (var p in s.GetType().GetProperties())
                 {
-                    rep.AttrFailed++;
-                    rep.Note($"attr '{an}' on {src.GetType().Name}: {ex.InnerException?.Message ?? ex.Message}");
+                    if (p.GetIndexParameters().Length > 0 || Skip.Contains(p.Name)) continue;
+                    object? sv; try { sv = p.GetValue(s); } catch { continue; }
+                    if (sv == null) continue;
+                    var dp = d.GetType().GetProperty(p.Name);
+                    if (dp == null) continue;
+
+                    if (Simple(sv))
+                    {
+                        if (!p.CanWrite || !dp.CanWrite) continue;
+                        object? dv = null; try { dv = dp.GetValue(d); } catch { }
+                        if (Equals(sv, dv)) continue;
+                        try { dp.SetValue(d, sv); PropsCopied++; }
+                        catch (Exception e) { PropsFailed++; Note($"set {path}.{p.Name}: {Msg(e)}"); }
+                    }
+                    else if (sv is MultilingualText sml)
+                    {
+                        if (dp.GetValue(d) is MultilingualText dml) CopyText(sml, dml, path + "." + p.Name);
+                    }
+                    else if (sv.GetType().Namespace == "Siemens.Engineering.HmiUnified.UI.Parts" && !sv.GetType().Name.EndsWith("Composition"))
+                    {
+                        object? dv = null; try { dv = dp.GetValue(d); } catch { }
+                        if (dv != null) { CopyProps(sv, dv, path + "." + p.Name); CopyDyn(sv, dv, path + "." + p.Name); }
+                    }
                 }
             }
-        }
 
-        private void CloneDynamizations(object src, object dest, CloneReport rep)
-        {
-            var srcDyn = Snapshot(src.GetType().GetProperty("Dynamizations")?.GetValue(src));
-            var destDynComp = dest.GetType().GetProperty("Dynamizations")?.GetValue(dest);
-            if (srcDyn.Count == 0 || destDynComp == null) return;
-
-            var createGen = destDynComp.GetType().GetMethods()
-                .FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethodDefinition
-                    && m.GetParameters().Length == 1 && m.GetParameters()[0].ParameterType == typeof(string));
-            if (createGen == null) return;
-
-            foreach (var d in srcDyn)
+            private void CopyText(MultilingualText s, MultilingualText d, string path)
             {
-                if (d == null) continue;
-                var dtype = d.GetType();
-                var propName = ReadHmiProp(d, "PropertyName");
-                try
+                foreach (var si in s.Items.ToList())
                 {
-                    var newD = createGen.MakeGenericMethod(dtype).Invoke(destDynComp, new object[] { propName });
-                    CopyAttributes(d, newD, rep);
-                    rep.DynCreated++;
+                    var di = d.Items.FirstOrDefault(x => x.Language.Culture.Name == si.Language.Culture.Name);
+                    if (di == null || di.Text == si.Text) continue;
+                    try { di.Text = si.Text; PropsCopied++; }
+                    catch (Exception e) { PropsFailed++; Note($"text {path}: {Msg(e)}"); }
                 }
-                catch (Exception ex)
+            }
+
+            private void CopyDyn(object s, object d, string path)
+            {
+                var sp = s.GetType().GetProperty("Dynamizations"); var dp = d.GetType().GetProperty("Dynamizations");
+                if (sp == null || dp == null) return;
+                var sc = Snap(sp.GetValue(s)); if (sc.Count == 0) return;
+                var dc = dp.GetValue(d); if (dc == null) return;
+                var create = dc.GetType().GetMethods().FirstOrDefault(m => m.Name == "Create" && m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+                if (create == null) return;
+                foreach (var sd in sc)
                 {
-                    rep.DynFailed++;
-                    rep.Note($"dyn {dtype.Name} on '{propName}': {ex.InnerException?.Message ?? ex.Message}");
+                    var pn = Get(sd, "PropertyName") as string ?? "";
+                    try
+                    {
+                        var nd = create.MakeGenericMethod(sd.GetType()).Invoke(dc, new object[] { pn })!;
+                        CopyProps(sd, nd, path + ".dyn." + pn);
+                        CopyConverter(sd, nd, path + ".dyn." + pn);
+                        DynCreated++;
+                    }
+                    catch (Exception e) { DynFailed++; Note($"dyn {path}.{pn}: {Msg(e)}"); }
+                }
+            }
+
+            // ValueConverter = Formula + MappingTable (range / bitmask entries). Copied member by member.
+            // Single-bit entries are pre-created by TIA when the condition is bitmask -> fill the existing ones instead of creating.
+            private void CopyConverter(object sd, object nd, string path)
+            {
+                var sv = Get(sd, "ValueConverter"); var dv = Get(nd, "ValueConverter");
+                if (sv == null || dv == null) return;
+                CopyProps(sv, dv, path + ".conv");
+                var smt = Get(sv, "MappingTable"); var dmt = Get(dv, "MappingTable");
+                if (smt == null || dmt == null) return;
+                CopyProps(smt, dmt, path + ".mt");
+                var se = Snap(Get(smt, "Entries")); if (se.Count == 0) return;
+                var dec = Get(dmt, "Entries"); if (dec == null) return;
+                var existing = Snap(dec).Where(x => x.GetType().Name.Contains("Bitmask")).ToList(); int bi = 0;
+                var cg = dec.GetType().GetMethods().First(m => m.Name == "Create" && m.IsGenericMethodDefinition && m.GetParameters().Length == 0);
+                foreach (var e in se)
+                {
+                    try
+                    {
+                        object ne;
+                        if (e.GetType().Name.Contains("Bitmask"))
+                        {
+                            if (bi < existing.Count) ne = existing[bi++];
+                            else
+                            {
+                                var bt = Get(e, "BitDynamizationType");
+                                var cb = dec.GetType().GetMethods().First(m => m.Name == "Create" && !m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+                                ne = Snap(cb.Invoke(dec, new object[] { bt! })).Last();
+                            }
+                        }
+                        else ne = cg.MakeGenericMethod(e.GetType()).Invoke(dec, null)!;
+                        CopyProps(e, ne, path + ".entry");
+                    }
+                    catch (Exception ex) { DynFailed++; Note($"mapping entry {path}: {Msg(ex)}"); }
+                }
+            }
+
+            private void CopyEventHandlers(object s, object d, string path)
+            {
+                var sp = s.GetType().GetProperty("EventHandlers"); var dp = d.GetType().GetProperty("EventHandlers");
+                if (sp == null || dp == null) return;
+                var sc = Snap(sp.GetValue(s)); if (sc.Count == 0) return;
+                var dc = dp.GetValue(d); if (dc == null) return;
+                var cm = dc.GetType().GetMethods().FirstOrDefault(m => m.Name == "Create" && !m.IsGenericMethodDefinition && m.GetParameters().Length == 1);
+                if (cm == null) return;
+                foreach (var se in sc)
+                {
+                    var et = Get(se, "EventType");
+                    try
+                    {
+                        var ne = cm.Invoke(dc, new object?[] { et })!;
+                        var ss = Get(se, "Script"); var ds = Get(ne, "Script");
+                        if (ss != null && ds != null) CopyProps(ss, ds, path + ".script");
+                        EhCreated++;
+                    }
+                    catch (Exception e) { EhFailed++; Note($"event {path} {et}: {Msg(e)}"); }
+                }
+            }
+
+            private void CopyInterface(object s, object d, string path)
+            {
+                var si = Get(s, "Interface"); var di = Get(d, "Interface"); if (si == null || di == null) return;
+                var dlist = Snap(di);
+                foreach (var se in Snap(si))
+                {
+                    var pn = Get(se, "PropertyName") as string;
+                    var de = dlist.FirstOrDefault(x => (Get(x, "PropertyName") as string) == pn);
+                    if (de == null) { Note($"interface entry missing {path}.{pn}"); continue; }
+                    CopyProps(se, de, path + ".if." + pn); CopyDyn(se, de, path + ".if." + pn);
+                }
+            }
+
+            private void CopyThresholds(object s, object d, string path)
+            {
+                var sl = Snap(Get(s, "Thresholds")); var dl = Snap(Get(d, "Thresholds"));
+                for (int i = 0; i < Math.Min(sl.Count, dl.Count); i++) { CopyProps(sl[i], dl[i], path + ".thr" + i); CopyDyn(sl[i], dl[i], path + ".thr" + i); }
+                if (sl.Count != dl.Count) Note($"thresholds: {sl.Count} source / {dl.Count} destination ({path})");
+            }
+
+            private void CloneItems(object sc, object dc, string path, int depth)
+            {
+                var sp = sc.GetType().GetProperty("ScreenItems"); var dp = dc.GetType().GetProperty("ScreenItems");
+                if (sp == null || dp == null || depth > 6) return;
+                var items = Snap(sp.GetValue(sc));
+                var dcomp = dp.GetValue(dc); if (dcomp == null) return;
+                var gens = dcomp.GetType().GetMethods().Where(m => m.Name == "Create" && m.IsGenericMethodDefinition).ToList();
+                foreach (var item in items)
+                {
+                    var t = item.GetType(); var name = Get(item, "Name") as string ?? "";
+                    object ni;
+                    try
+                    {
+                        if (t.Name == "HmiFaceplateContainer")
+                        {
+                            var ct = Get(item, "ContainedType") as string ?? "";
+                            ni = gens.First(g => g.GetParameters().Length == 2).MakeGenericMethod(t).Invoke(dcomp, new object[] { name, ct })!;
+                        }
+                        else if (t.Name == "HmiCustomWidgetContainer")
+                            throw new InvalidOperationException("custom widget not supported by Openness (add by hand)");
+                        else
+                            ni = gens.First(g => g.GetParameters().Length == 1).MakeGenericMethod(t).Invoke(dcomp, new object[] { name })!;
+                        ItemsCreated++;
+                    }
+                    catch (Exception e) { ItemsFailed++; Note($"create {t.Name} '{name}': {Msg(e)}"); continue; }
+
+                    var p2 = path + "/" + name;
+                    CopyProps(item, ni, p2);
+                    CopyInterface(item, ni, p2);
+                    CopyThresholds(item, ni, p2);
+                    CopyDyn(item, ni, p2);
+                    CopyEventHandlers(item, ni, p2);
+                    CloneItems(item, ni, p2, depth + 1);
                 }
             }
         }

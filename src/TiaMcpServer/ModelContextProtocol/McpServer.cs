@@ -2544,15 +2544,52 @@ namespace TiaMcpServer.ModelContextProtocol
             }
         }
 
-        [McpServerTool(Name = "CloneHmiScreen"), Description("Proof-of-concept: recreate (clone) a WinCC Unified screen into a new screen by rebuilding its screen items via the object model (Openness has no screen Copy). Returns a coverage report (items/attributes/dynamizations created vs failed).")]
-        public static ResponseMessage CloneHmiScreen(
-            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
-            [Description("srcScreen: name of the existing source screen to clone")] string srcScreen,
-            [Description("destScreen: name of the new screen to create")] string destScreen)
+        [McpServerTool(Name = "CreateHmiConnection"), Description("Create an integrated HMI connection between a WinCC Unified HMI device and a PLC at hardware level, so the WinCC connection gets its Partner/Station/Node (read-only otherwise). Both devices must be on the same subnet. Afterwards HMI tags can bind PLC tags symbolically. Calling it twice creates a duplicate connection.")]
+        public static ResponseMessage CreateHmiConnection(
+            [Description("hmiDevice: name of the HMI device (e.g. 'HMI_1')")] string hmiDevice,
+            [Description("plcDevice: name of the PLC device (e.g. 'PLC_1' or 'ET200SP_station')")] string plcDevice,
+            [Description("connectionName: optional new name for the created connection (default HMI_Liaison_n)")] string connectionName = "")
         {
             try
             {
-                var dump = Portal.CloneHmiScreen(softwarePath, srcScreen, destScreen);
+                var r = Portal.CreateHmiConnection(hmiDevice, plcDevice, connectionName);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error creating HMI connection: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "CloneHmiScreenGroup"), Description("Clone every screen of a WinCC Unified screen group into a (new) screen group. Screen names starting with oldPrefix get newPrefix (e.g. 10 -> 11: 1010_Overview -> 1110_Overview). Same fidelity as CloneHmiScreen. Custom widgets are not copied.")]
+        public static ResponseMessage CloneHmiScreenGroup(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("srcGroup: name of the source screen group")] string srcGroup,
+            [Description("destGroup: name of the destination screen group (created if missing)")] string destGroup,
+            [Description("oldPrefix: leading characters of screen names to replace (e.g. '10')")] string oldPrefix,
+            [Description("newPrefix: replacement prefix (e.g. '11')")] string newPrefix)
+        {
+            try
+            {
+                var dump = Portal.CloneHmiScreenGroup(softwarePath, srcGroup, destGroup, oldPrefix, newPrefix);
+                return new ResponseMessage { Message = dump, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !dump.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error cloning HMI screen group '{srcGroup}': {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "CloneHmiScreen"), Description("Clone a WinCC Unified screen into a new screen by rebuilding it through the object model (Openness has no screen Copy). Copies items in z-order with all writable properties, fonts/paddings, multilingual texts, dynamizations (tag, resource list, script) incl. value converters and mapping tables, event-handler scripts, faceplate interface values and IO-field thresholds. Custom widgets are not copied (reported). Returns a coverage report. Tip: SaveProject before cloning.")]
+        public static ResponseMessage CloneHmiScreen(
+            [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
+            [Description("srcScreen: name of the existing source screen to clone")] string srcScreen,
+            [Description("destScreen: name of the new screen to create")] string destScreen,
+            [Description("destGroup: optional name of the destination screen group (default: same container as the source)")] string destGroup = "")
+        {
+            try
+            {
+                var dump = Portal.CloneHmiScreen(softwarePath, srcScreen, destScreen, string.IsNullOrEmpty(destGroup) ? null : destGroup);
                 return new ResponseMessage
                 {
                     Message = dump,

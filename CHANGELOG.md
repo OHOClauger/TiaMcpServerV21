@@ -1,5 +1,16 @@
 ﻿# Change Log
 
+## [1.0.1] - 2026-10-14
+
+### New Tools (2)
+- **HMI Unified**: `CreateHmiConnection` (create the integrated HMI/PLC hardware connection so HMI tags can bind PLC tags symbolically), `CloneHmiScreenGroup` (clone every screen of a WinCC Unified screen group into a new/existing group, with prefix rename)
+
+### Improvements
+- `CloneHmiScreen` is no longer a proof-of-concept: copies items in z-order with all writable properties, fonts/paddings, multilingual texts, dynamizations (tag, resource list, script) incl. value converters and mapping tables, event-handler scripts, faceplate interface values and IO-field thresholds; new optional `destGroup` parameter
+
+### Infrastructure
+- Bump: AssemblyVersion 1.0.0 -> 1.0.1 (70 tools)
+
 ## [1.0.0] - 2026-10-14
 
 ### New Tools (3)
