@@ -69,7 +69,7 @@ dotnet build -c Release
 # Output: src/TiaMcpServer/bin/Release/net48/TiaMcpServer.exe
 ```
 
-## Available Tools (65)
+## Available Tools (68)
 
 ### Connection & State
 
@@ -161,6 +161,9 @@ dotnet build -c Release
 | `GetHmiTags` | List HMI tags (WinCC Unified) with connection, PLC tag/address and data type |
 | `ExportHmiTags` | Export an HMI tag table's tags to XML (WinCC Unified) |
 | `ImportHmiTags` | Import HMI tags into a tag table (WinCC Unified, override) |
+| `SetHmiScreenItemAttributes` | Set attributes (Left, Top, Width, Height, Visible, Text, ...) on screen items of a WinCC Unified screen, e.g. to lay out a cloned screen |
+| `GetHmiDiscreteAlarms` | List WinCC Unified discrete alarms (name, class, trigger, event text per project language) |
+| `SetHmiDiscreteAlarms` | Create or update WinCC Unified discrete alarms and fill their multilingual texts |
 
 ### Development
 

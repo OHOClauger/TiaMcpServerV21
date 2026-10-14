@@ -2046,6 +2046,242 @@ namespace TiaMcpServer.Siemens
             }
         }
 
+        // ---- WinCC Unified: screen item layout / generic attributes and discrete alarms ----
+
+        // Finds a screen item by plain name (first match anywhere in the tree) or by "Container/Item" path.
+        private object? FindScreenItem(object screen, string itemPath)
+        {
+            var parts = itemPath.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return null;
+            if (parts.Length == 1) return FindScreenItemByName(screen, parts[0], 0);
+
+            object? cur = screen;
+            foreach (var part in parts)
+            {
+                object? next = null;
+                foreach (var item in Snapshot(cur.GetType().GetProperty("ScreenItems")?.GetValue(cur)))
+                {
+                    if (string.Equals(ReadHmiProp(item, "Name"), part, StringComparison.OrdinalIgnoreCase)) { next = item; break; }
+                }
+                if (next == null) return null;
+                cur = next;
+            }
+            return cur;
+        }
+
+        private object? FindScreenItemByName(object container, string name, int depth)
+        {
+            if (depth > 8) return null;
+            foreach (var item in Snapshot(container.GetType().GetProperty("ScreenItems")?.GetValue(container)))
+            {
+                if (string.Equals(ReadHmiProp(item, "Name"), name, StringComparison.OrdinalIgnoreCase)) return item;
+                var nested = FindScreenItemByName(item, name, depth + 1);
+                if (nested != null) return nested;
+            }
+            return null;
+        }
+
+        // Converts a JSON scalar to the runtime type of the attribute's current value (enum, number, bool, string).
+        private static object? ConvertAttributeValue(object target, string attrName, System.Text.Json.Nodes.JsonNode? node)
+        {
+            if (node == null) return null;
+            if (node is not System.Text.Json.Nodes.JsonValue jv) throw new ArgumentException("attribute values must be JSON scalars");
+
+            object? current = null;
+            try { current = target.GetType().GetMethod("GetAttribute", new[] { typeof(string) })?.Invoke(target, new object[] { attrName }); }
+            catch { }
+
+            var text = jv.ToString();
+            var type = current?.GetType();
+            if (type == null)
+            {
+                if (bool.TryParse(text, out var b)) return b;
+                if (double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var d)) return d;
+                return text;
+            }
+            if (type.IsEnum) return Enum.Parse(type, text, true);
+            if (type == typeof(string)) return text;
+            return Convert.ChangeType(text, type, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        // Sets arbitrary attributes (Left, Top, Width, Height, Visible, Text, ...) on screen items of a Unified screen.
+        // changesJson: [{"item":"Name" | "Container/Name" | ".", "attributes":{"Left":100,"Top":50}}, ...]  ("." = the screen itself)
+        public string SetHmiScreenItemAttributes(string softwarePath, string screenName, string changesJson)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var screen = FindHmiScreen(software, screenName);
+                if (screen == null) return $"ERROR: screen not found: {screenName}";
+
+                var changes = System.Text.Json.Nodes.JsonNode.Parse(changesJson) as System.Text.Json.Nodes.JsonArray;
+                if (changes == null) return "ERROR: changesJson must be a JSON array of {\"item\":\"name\",\"attributes\":{...}}";
+
+                int ok = 0, ko = 0;
+                var notes = new List<string>();
+                foreach (var entry in changes)
+                {
+                    var itemName = entry?["item"]?.ToString();
+                    var attrs = entry?["attributes"] as System.Text.Json.Nodes.JsonObject;
+                    if (string.IsNullOrEmpty(itemName) || attrs == null) { ko++; notes.Add("entry without 'item' or 'attributes' skipped"); continue; }
+
+                    var item = itemName == "." ? screen : FindScreenItem(screen, itemName!);
+                    if (item == null) { ko += attrs.Count; notes.Add($"item not found: {itemName}"); continue; }
+
+                    var setA = item.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) });
+                    if (setA == null) { ko += attrs.Count; notes.Add($"{itemName}: no SetAttribute"); continue; }
+
+                    foreach (var kv in attrs)
+                    {
+                        try
+                        {
+                            setA.Invoke(item, new object?[] { kv.Key, ConvertAttributeValue(item, kv.Key, kv.Value) });
+                            ok++;
+                        }
+                        catch (Exception ex)
+                        {
+                            ko++;
+                            notes.Add($"{itemName}.{kv.Key}: {ex.InnerException?.Message ?? ex.Message}");
+                        }
+                    }
+                }
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Screen '{screenName}': attributes set {ok}, failed {ko}");
+                foreach (var n in notes.Take(60)) sb.AppendLine("  - " + n);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "SetHmiScreenItemAttributes failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        private static string ItemCulture(object textItem)
+        {
+            var lang = textItem.GetType().GetProperty("Language")?.GetValue(textItem);
+            var culture = lang?.GetType().GetProperty("Culture")?.GetValue(lang);
+            return (culture?.GetType().GetProperty("Name")?.GetValue(culture) as string) ?? lang?.ToString() ?? "?";
+        }
+
+        private string ReadMultilingual(object owner, string propName)
+        {
+            var mt = owner.GetType().GetProperty(propName)?.GetValue(owner);
+            if (mt == null) return "";
+            var parts = new List<string>();
+            foreach (var it in Snapshot(mt.GetType().GetProperty("Items")?.GetValue(mt)))
+                parts.Add($"{ItemCulture(it)}='{it.GetType().GetProperty("Text")?.GetValue(it)}'");
+            return string.Join(" ; ", parts);
+        }
+
+        // Lists WinCC Unified discrete alarms with their event text per project language.
+        public string GetHmiDiscreteAlarms(string softwarePath, string regexName = "")
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var alarms = software.GetType().GetProperty("DiscreteAlarms")?.GetValue(software);
+                if (alarms == null) return "ERROR: software has no DiscreteAlarms composition";
+
+                var sb = new StringBuilder();
+                int count = 0;
+                foreach (var a in Snapshot(alarms))
+                {
+                    var name = ReadHmiProp(a, "Name");
+                    if (!string.IsNullOrEmpty(regexName) && !Regex.IsMatch(name, regexName, RegexOptions.IgnoreCase)) continue;
+                    sb.AppendLine($"{name} | class={ReadHmiProp(a, "AlarmClass")} | trigger={ReadHmiProp(a, "TriggerMode")} | bit={ReadHmiProp(a, "TriggerBitAddress")} | EventText: {ReadMultilingual(a, "EventText")}");
+                    count++;
+                }
+                sb.Insert(0, $"Discrete alarms in '{softwarePath}' matching '{regexName}': {count}\r\n");
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "GetHmiDiscreteAlarms failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
+        // Creates (if missing) or updates discrete alarms and fills their multilingual texts.
+        // alarmsJson: [{"name":"A","field":"EventText"(default),"texts":{"fr-FR":"...","en-US":"..."},"attributes":{"TriggerBitAddress":3}}, ...]
+        public string SetHmiDiscreteAlarms(string softwarePath, string alarmsJson)
+        {
+            if (IsProjectNull()) return "ERROR: no project open";
+            try
+            {
+                var software = GetSoftwareContainer(softwarePath)?.Software;
+                if (software == null) return $"ERROR: HMI software not found: {softwarePath}";
+                var comp = software.GetType().GetProperty("DiscreteAlarms")?.GetValue(software);
+                if (comp == null) return "ERROR: software has no DiscreteAlarms composition";
+                var findM = comp.GetType().GetMethod("Find", new[] { typeof(string) });
+                var createM = comp.GetType().GetMethod("Create", new[] { typeof(string) });
+                if (findM == null || createM == null) return "ERROR: DiscreteAlarms has no Find/Create(string)";
+
+                var list = System.Text.Json.Nodes.JsonNode.Parse(alarmsJson) as System.Text.Json.Nodes.JsonArray;
+                if (list == null) return "ERROR: alarmsJson must be a JSON array of {\"name\":...,\"texts\":{...}}";
+
+                int created = 0, updated = 0, textsSet = 0, failed = 0;
+                var notes = new List<string>();
+                foreach (var entry in list)
+                {
+                    var name = entry?["name"]?.ToString();
+                    if (string.IsNullOrEmpty(name)) { failed++; notes.Add("entry without 'name' skipped"); continue; }
+                    try
+                    {
+                        var alarm = findM.Invoke(comp, new object[] { name! });
+                        if (alarm == null) { alarm = createM.Invoke(comp, new object[] { name! }); created++; }
+                        else updated++;
+
+                        if (entry?["attributes"] is System.Text.Json.Nodes.JsonObject attrs)
+                        {
+                            var setA = alarm!.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) });
+                            foreach (var kv in attrs)
+                            {
+                                try { setA?.Invoke(alarm, new object?[] { kv.Key, ConvertAttributeValue(alarm, kv.Key, kv.Value) }); }
+                                catch (Exception ex) { failed++; notes.Add($"{name}.{kv.Key}: {ex.InnerException?.Message ?? ex.Message}"); }
+                            }
+                        }
+
+                        if (entry?["texts"] is System.Text.Json.Nodes.JsonObject texts)
+                        {
+                            var field = entry?["field"]?.ToString() ?? "EventText";
+                            var mt = alarm!.GetType().GetProperty(field)?.GetValue(alarm);
+                            var items = Snapshot(mt?.GetType().GetProperty("Items")?.GetValue(mt));
+                            foreach (var kv in texts)
+                            {
+                                var item = items.FirstOrDefault(i => string.Equals(ItemCulture(i), kv.Key, StringComparison.OrdinalIgnoreCase));
+                                if (item == null) { failed++; notes.Add($"{name}.{field}: language '{kv.Key}' not in project (have: {string.Join(",", items.Select(ItemCulture))})"); continue; }
+                                var tp = item.GetType().GetProperty("Text");
+                                if (tp != null && tp.CanWrite) tp.SetValue(item, kv.Value?.ToString() ?? "");
+                                else item.GetType().GetMethod("SetAttribute", new[] { typeof(string), typeof(object) })?.Invoke(item, new object[] { "Text", kv.Value?.ToString() ?? "" });
+                                textsSet++;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failed++;
+                        notes.Add($"{name}: {ex.InnerException?.Message ?? ex.Message}");
+                    }
+                }
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Alarms created {created}, updated {updated}, texts set {textsSet}, failures {failed}");
+                foreach (var n in notes.Take(60)) sb.AppendLine("  - " + n);
+                return sb.ToString();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "SetHmiDiscreteAlarms failed");
+                return "ERROR: " + (ex.InnerException?.Message ?? ex.Message);
+            }
+        }
+
         private static int CountOcc(string s, string sub)
         {
             int c = 0, i = 0;
