@@ -4,7 +4,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>Latest</LangVersion>
     <OutputType>Exe</OutputType>
-    <AssemblyVersion>0.0.21.0</AssemblyVersion>
+    <AssemblyVersion>0.0.22.0</AssemblyVersion>
     <BaseOutputPath>.\bin</BaseOutputPath>
   </PropertyGroup>
   <ItemGroup>

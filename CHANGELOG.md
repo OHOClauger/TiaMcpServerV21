@@ -1,5 +1,13 @@
-# Change Log
+﻿# Change Log
 
+## [0.0.22] - 2026-10-14
+
+### New Tools (3)
+- **HMI Unified**: `SetHmiScreenItemAttributes` (set Left/Top/Width/Height/Visible/... on screen items, batch JSON), `GetHmiDiscreteAlarms` (list alarms with multilingual event text), `SetHmiDiscreteAlarms` (create/update discrete alarms and fill EventText per language)
+
+### Infrastructure
+- Sync: HMI Unified tools (screens, tags, clone, repoint) and `EvalCSharp` dev tool brought into the repository
+- Bump: AssemblyVersion 0.0.21 -> 0.0.22
 ## [0.0.20] - 2026-06-02
 
 ### New Tools (2)

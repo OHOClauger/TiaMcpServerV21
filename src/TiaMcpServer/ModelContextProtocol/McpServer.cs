@@ -2495,6 +2495,55 @@ namespace TiaMcpServer.ModelContextProtocol
             }
         }
 
+        [McpServerTool(Name = "SetHmiScreenItemAttributes"), Description("Set attributes (Left, Top, Width, Height, Visible, Text, ...) on screen items of a WinCC Unified screen, e.g. to lay out a cloned screen. Values are converted to the attribute's type. Returns a report of attributes set/failed.")]
+        public static ResponseMessage SetHmiScreenItemAttributes(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("screenName: screen to modify")] string screenName,
+            [Description("changesJson: JSON array [{\"item\":\"Name\" or \"Container/Name\" or \".\" (the screen), \"attributes\":{\"Left\":100,\"Top\":50,\"Width\":200,\"Height\":40}}]")] string changesJson)
+        {
+            try
+            {
+                var r = Portal.SetHmiScreenItemAttributes(softwarePath, screenName, changesJson);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error setting screen item attributes: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "GetHmiDiscreteAlarms"), Description("List WinCC Unified discrete alarms (name, class, trigger, event text per project language), optionally filtered by regex on the name.")]
+        public static ResponseMessage GetHmiDiscreteAlarms(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("regexName: optional regex filter on the alarm name")] string regexName = "")
+        {
+            try
+            {
+                var r = Portal.GetHmiDiscreteAlarms(softwarePath, regexName);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error listing discrete alarms: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
+        [McpServerTool(Name = "SetHmiDiscreteAlarms"), Description("Create or update WinCC Unified discrete alarms and fill their multilingual texts (EventText by default). Existing alarms are updated, missing ones created. Returns a report.")]
+        public static ResponseMessage SetHmiDiscreteAlarms(
+            [Description("softwarePath: path to the HMI software")] string softwarePath,
+            [Description("alarmsJson: JSON array [{\"name\":\"Alarm\",\"field\":\"EventText\" (optional),\"texts\":{\"fr-FR\":\"Defaut\",\"en-US\":\"Fault\"},\"attributes\":{\"TriggerBitAddress\":3} (optional)}]")] string alarmsJson)
+        {
+            try
+            {
+                var r = Portal.SetHmiDiscreteAlarms(softwarePath, alarmsJson);
+                return new ResponseMessage { Message = r, Meta = new JsonObject { ["timestamp"] = DateTime.Now, ["success"] = !r.StartsWith("ERROR") } };
+            }
+            catch (Exception ex) when (ex is not McpException)
+            {
+                throw new McpException($"Unexpected error setting discrete alarms: {ex.Message}", ex, McpErrorCode.InternalError);
+            }
+        }
+
         [McpServerTool(Name = "CloneHmiScreen"), Description("Proof-of-concept: recreate (clone) a WinCC Unified screen into a new screen by rebuilding its screen items via the object model (Openness has no screen Copy). Returns a coverage report (items/attributes/dynamizations created vs failed).")]
         public static ResponseMessage CloneHmiScreen(
             [Description("softwarePath: defines the path in the project structure to the HMI software")] string softwarePath,
